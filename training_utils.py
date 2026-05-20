@@ -114,19 +114,32 @@ def plot_pareto_front(pareto_individuals: list, filepath: str) -> None:
     knee_idx: int = knee_point_index(pareto_individuals)
     best_sign_idx: int = best_sign_consistency_index(pareto_individuals)
     best_auc_idx: int = best_auc_index(pareto_individuals)
-    highlight_indices: set[int] = {knee_idx, best_sign_idx, best_auc_idx}
 
+    # Filter the background scatter by FITNESS COORDINATE, not by index, so
+    # that any Pareto individual whose (AUC, sign-consistency) tuple equals a
+    # highlighted candidate's is suppressed too. Without this, the GA's
+    # population convergence (multiple individuals collapsing to the same
+    # fitness tuple) produces "ghost" background points sitting exactly under
+    # the highlight markers.
+    highlight_coords: set[tuple[float, float]] = {
+        (float(auc_vals[knee_idx]),      float(sign_vals[knee_idx])),
+        (float(auc_vals[best_sign_idx]), float(sign_vals[best_sign_idx])),
+        (float(auc_vals[best_auc_idx]),  float(sign_vals[best_auc_idx])),
+    }
     other_mask: numpy.ndarray = numpy.array(
-        [i not in highlight_indices for i in range(len(pareto_individuals))], dtype=bool)
+        [(float(auc_vals[i]), float(sign_vals[i])) not in highlight_coords
+         for i in range(len(pareto_individuals))],
+        dtype=bool,
+    )
 
     _apply_plot_theme()
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Background: all other Pareto solutions in a muted colour.
+    # Background: all other Pareto solutions in the original royalblue.
     if other_mask.any():
         ax.scatter(auc_vals[other_mask], sign_vals[other_mask],
-                   c="lightsteelblue", alpha=0.75, edgecolors="black", s=55,
-                   label=f"Other Pareto points",
+                   c="royalblue", alpha=0.75, edgecolors="black", s=55,
+                   label="Other Pareto points",
                    zorder=2)
 
     # Highlight: best AUC (green triangle) -- only if distinct from the others.
