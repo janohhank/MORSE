@@ -248,7 +248,9 @@ def run_noise_evaluation(
 # ---------------------------------------------------------------------------
 
 def plot_robustness_heatmaps(results_df: pandas.DataFrame, filepath: str,
-                             dataset_label: str = "Test") -> None:
+                             dataset_label: str = "Test", use_roc_auc: bool = True) -> None:
+    MAIN_OBJECTIVE: str = "ROC-AUC" if use_roc_auc == True else "PR-AUC"
+
     """Side-by-side heatmaps: multi vs single under Gaussian noise + shift."""
     ensure_directory(os.path.dirname(filepath))
 
@@ -272,15 +274,15 @@ def plot_robustness_heatmaps(results_df: pandas.DataFrame, filepath: str,
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
     sns.heatmap(pivot_multi, cmap="viridis", vmin=vmin, vmax=vmax, annot=False,
-                cbar_kws={"label": f"{dataset_label} ROC-AUC"}, ax=axes[0])
-    axes[0].set_title(f"Multi-Objective (SiCo-MOGA) Robustness\n"
+                cbar_kws={"label": f"{dataset_label} {MAIN_OBJECTIVE}"}, ax=axes[0])
+    axes[0].set_title(f"Multi-Objective (MORSE) Robustness\n"
                       f"Clean AUC = {clean_multi:.4f} | AUC range [{vmin:.4f}, {vmax:.4f}]",
                       fontweight="bold", pad=15)
     axes[0].set_xlabel("Gaussian Noise Level (fraction of training std)", fontweight="bold")
     axes[0].set_ylabel("Systematic Mean Shift (fraction of training std)", fontweight="bold")
 
     sns.heatmap(pivot_single, cmap="viridis", vmin=vmin, vmax=vmax, annot=False,
-                cbar_kws={"label": f"{dataset_label} ROC-AUC"}, ax=axes[1])
+                cbar_kws={"label": f"{dataset_label} {MAIN_OBJECTIVE}"}, ax=axes[1])
     axes[1].set_title(f"Single-Objective (AUC-only GA) Robustness\n"
                       f"Clean AUC = {clean_single:.4f} | AUC range [{vmin:.4f}, {vmax:.4f}]",
                       fontweight="bold", pad=15)
@@ -295,7 +297,9 @@ def plot_robustness_heatmaps(results_df: pandas.DataFrame, filepath: str,
 
 
 def plot_dummy_flip_comparison(results_df: pandas.DataFrame, filepath: str,
-                               dataset_label: str = "Test") -> None:
+                               dataset_label: str = "Test", use_roc_auc: bool = True) -> None:
+    MAIN_OBJECTIVE: str = "ROC-AUC" if use_roc_auc == True else "PR-AUC"
+
     """Line plot: multi vs single AUC under increasing bit-flip rate."""
     ensure_directory(os.path.dirname(filepath))
 
@@ -304,11 +308,11 @@ def plot_dummy_flip_comparison(results_df: pandas.DataFrame, filepath: str,
     _apply_plot_theme()
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(df_flip["flip_rate"], df_flip["auc_multi"],
-            label="Multi-Objective (SiCo-MOGA)", linewidth=2, marker="o", color="tab:blue")
+            label="Multi-Objective (MORSE)", linewidth=2, marker="o", color="tab:blue")
     ax.plot(df_flip["flip_rate"], df_flip["auc_single"],
             label="Single-Objective (AUC-only GA)", linewidth=2, marker="s", linestyle="--", color="tab:orange")
     ax.set_xlabel("Corruption Fraction (proportion of dummy cells randomised)", fontweight="bold")
-    ax.set_ylabel(f"{dataset_label} ROC-AUC", fontweight="bold")
+    ax.set_ylabel(f"{dataset_label} {MAIN_OBJECTIVE}", fontweight="bold")
     ax.set_title(f"Robustness on {dataset_label} Set: Random Corruption Noise on Binary (Dummy) Features\n"
                  f"(corrupted cells replaced with uniform random {{0, 1}})",
                  fontweight="bold", pad=10)
@@ -325,7 +329,9 @@ def plot_dummy_flip_comparison(results_df: pandas.DataFrame, filepath: str,
 
 
 def plot_gaussian_noise_comparison(results_df: pandas.DataFrame, filepath: str,
-                                    dataset_label: str = "Test") -> None:
+                                    dataset_label: str = "Test", use_roc_auc: bool = True) -> None:
+    MAIN_OBJECTIVE: str = "ROC-AUC" if use_roc_auc == True else "PR-AUC"
+
     """Line plot: multi vs single AUC under Gaussian noise (zero mean-shift)."""
     ensure_directory(os.path.dirname(filepath))
 
@@ -337,12 +343,12 @@ def plot_gaussian_noise_comparison(results_df: pandas.DataFrame, filepath: str,
     _apply_plot_theme()
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(df_gauss["noise_level"], df_gauss["auc_multi"],
-            label="Multi-Objective (SiCo-MOGA)", linewidth=2, marker="o", color="tab:blue")
+            label="Multi-Objective (MORSE)", linewidth=2, marker="o", color="tab:blue")
     ax.plot(df_gauss["noise_level"], df_gauss["auc_single"],
             label="Single-Objective (AUC-only GA)", linewidth=2, marker="s", linestyle="--", color="tab:orange")
     ax.set_xlabel("Gaussian Noise Level (fraction of training std, no mean shift)",
                   fontweight="bold")
-    ax.set_ylabel(f"{dataset_label} ROC-AUC", fontweight="bold")
+    ax.set_ylabel(f"{dataset_label} {MAIN_OBJECTIVE}", fontweight="bold")
     ax.set_title(f"Robustness on {dataset_label} Set: Additive Gaussian Noise on Continuous Features\n"
                  f"(zero systematic mean shift)",
                  fontweight="bold", pad=10)
@@ -390,9 +396,9 @@ def evaluate_and_save(
     ensure_directory(seed_dir)
 
     results_df.to_csv(os.path.join(seed_dir, f"noise_evaluation_{label_lower}.csv"), index=False)
-    plot_robustness_heatmaps(results_df, os.path.join(seed_dir, f"robustness_heatmaps_{label_lower}.png"), dataset_label)
-    plot_gaussian_noise_comparison(results_df, os.path.join(seed_dir, f"gaussian_noise_comparison_{label_lower}.png"), dataset_label)
-    plot_dummy_flip_comparison(results_df, os.path.join(seed_dir, f"dummy_flip_comparison_{label_lower}.png"), dataset_label)
+    plot_robustness_heatmaps(results_df, os.path.join(seed_dir, f"robustness_heatmaps_{label_lower}.png"), dataset_label, use_roc_auc)
+    plot_gaussian_noise_comparison(results_df, os.path.join(seed_dir, f"gaussian_noise_comparison_{label_lower}.png"), dataset_label, use_roc_auc)
+    plot_dummy_flip_comparison(results_df, os.path.join(seed_dir, f"dummy_flip_comparison_{label_lower}.png"), dataset_label, use_roc_auc)
 
     # Print summary for this seed
     clean: pandas.DataFrame = results_df[
@@ -473,7 +479,7 @@ def plot_stability_heatmap(
                 xticklabels=[f"Seed {s}" for s in seeds_multi],
                 yticklabels=[f"Seed {s}" for s in seeds_multi],
                 cbar=False)
-    axes[0].set_title(f"Multi-Objective (SiCo-MOGA)\n"
+    axes[0].set_title(f"Multi-Objective (MORSE)\n"
                       f"Mean pairwise Jaccard = {mean_multi:.3f}",
                       fontweight="bold", pad=15)
     axes[0].set_xlabel("Seed", fontweight="bold")
@@ -613,11 +619,11 @@ def plot_vif_boxplot(
         vif_multi: pandas.DataFrame,
         vif_single: pandas.DataFrame,
         filepath: str) -> None:
-    """Side-by-side boxplots comparing VIF distributions of MOGA vs SOGA selected features."""
+    """Side-by-side boxplots comparing VIF distributions of MORSE vs SOGA selected features."""
     ensure_directory(os.path.dirname(filepath))
 
     vif_multi_plot: pandas.DataFrame = vif_multi.copy()
-    vif_multi_plot["method"] = "Multi-Objective\n(SiCo-MOGA)"
+    vif_multi_plot["method"] = "Multi-Objective\n(MORSE)"
     vif_single_plot: pandas.DataFrame = vif_single.copy()
     vif_single_plot["method"] = "Single-Objective\n(AUC-only GA)"
 
@@ -628,7 +634,7 @@ def plot_vif_boxplot(
 
     # Left: boxplot by method
     sns.boxplot(data=combined, x="method", y="vif", hue="method", ax=axes[0],
-            palette={"Multi-Objective\n(SiCo-MOGA)": "tab:blue",
+            palette={"Multi-Objective\n(MORSE)": "tab:blue",
                      "Single-Objective\n(AUC-only GA)": "tab:orange"},
             width=0.5, legend=False)
     sns.stripplot(data=combined, x="method", y="vif", ax=axes[0],
@@ -645,7 +651,7 @@ def plot_vif_boxplot(
 
     # Summary statistics annotation
     for i, (method_name, df_method) in enumerate([
-        ("Multi-Objective\n(SiCo-MOGA)", vif_multi),
+        ("Multi-Objective\n(MORSE)", vif_multi),
         ("Single-Objective\n(AUC-only GA)", vif_single)
     ]):
         if not df_method.empty:
@@ -671,7 +677,7 @@ def plot_vif_boxplot(
     bar_height: float = 0.35
 
     axes[1].barh(y_pos - bar_height / 2, merged["vif_multi"],
-                 bar_height, label="Multi-Objective (SiCo-MOGA)", color="tab:blue", edgecolor="black")
+                 bar_height, label="Multi-Objective (MORSE)", color="tab:blue", edgecolor="black")
     axes[1].barh(y_pos + bar_height / 2, merged["vif_single"],
                  bar_height, label="Single-Objective (AUC-only GA)", color="tab:orange", edgecolor="black")
     axes[1].axvline(x=5.0, color="red", linestyle="--", alpha=0.7, label="VIF = 5")
