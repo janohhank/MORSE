@@ -99,16 +99,65 @@ def plot_multi_objective_convergence(stats: list[dict], filepath: str) -> None:
 
 
 def plot_pareto_front(pareto_individuals: list, filepath: str) -> None:
+    """Plot the Pareto front and highlight the three canonical model-selection
+    candidates: the knee point (balanced trade-off), the best sign-consistency
+    point, and the best AUC point. All other Pareto solutions are shown in a
+    muted neutral colour so the highlighted markers stand out."""
     ensure_directory(os.path.dirname(filepath))
-    auc_vals: list[float] = [ind.fitness.values[0] for ind in pareto_individuals]
-    sign_vals: list[float] = [ind.fitness.values[1] for ind in pareto_individuals]
+    auc_vals: numpy.ndarray = numpy.array(
+        [ind.fitness.values[0] for ind in pareto_individuals], dtype=float)
+    sign_vals: numpy.ndarray = numpy.array(
+        [ind.fitness.values[1] for ind in pareto_individuals], dtype=float)
+
+    # Resolve the three canonical selection indices. These helpers handle
+    # edge cases (single-point fronts, coincident endpoints) themselves.
+    knee_idx: int = knee_point_index(pareto_individuals)
+    best_sign_idx: int = best_sign_consistency_index(pareto_individuals)
+    best_auc_idx: int = best_auc_index(pareto_individuals)
+    highlight_indices: set[int] = {knee_idx, best_sign_idx, best_auc_idx}
+
+    other_mask: numpy.ndarray = numpy.array(
+        [i not in highlight_indices for i in range(len(pareto_individuals))], dtype=bool)
 
     _apply_plot_theme()
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(auc_vals, sign_vals, c="royalblue", alpha=0.7, edgecolors="black", s=50)
-    ax.set_xlabel("AUC")
-    ax.set_ylabel("Sign Consistency")
-    ax.set_title("Pareto Front (AUC vs Sign Consistency)")
+
+    # Background: all other Pareto solutions in a muted colour.
+    if other_mask.any():
+        ax.scatter(auc_vals[other_mask], sign_vals[other_mask],
+                   c="lightsteelblue", alpha=0.75, edgecolors="black", s=55,
+                   label=f"Other Pareto points (n={int(other_mask.sum())})",
+                   zorder=2)
+
+    # Highlight: best AUC (green triangle) -- only if distinct from the others.
+    if best_auc_idx != knee_idx and best_auc_idx != best_sign_idx:
+        ax.scatter(auc_vals[best_auc_idx], sign_vals[best_auc_idx],
+                   c="tab:green", edgecolors="black", linewidths=1.4,
+                   s=200, marker="^", zorder=4,
+                   label=f"Best AUC ({auc_vals[best_auc_idx]:.4f}, "
+                         f"{sign_vals[best_auc_idx]:.4f})")
+
+    # Highlight: best sign-consistency (orange diamond) -- only if distinct from knee.
+    if best_sign_idx != knee_idx:
+        ax.scatter(auc_vals[best_sign_idx], sign_vals[best_sign_idx],
+                   c="tab:orange", edgecolors="black", linewidths=1.4,
+                   s=200, marker="D", zorder=5,
+                   label=f"Best sign-consistency ({auc_vals[best_sign_idx]:.4f}, "
+                         f"{sign_vals[best_sign_idx]:.4f})")
+
+    # Highlight: knee point (red star) -- always drawn on top with the largest marker.
+    ax.scatter(auc_vals[knee_idx], sign_vals[knee_idx],
+               c="tab:red", edgecolors="black", linewidths=1.4,
+               s=320, marker="*", zorder=6,
+               label=f"Knee point ({auc_vals[knee_idx]:.4f}, "
+                     f"{sign_vals[knee_idx]:.4f})")
+
+    ax.set_xlabel("AUC", fontweight="bold")
+    ax.set_ylabel("Sign Consistency", fontweight="bold")
+    ax.set_title(f"Pareto Front (AUC vs Sign Consistency)\n"
+                 f"{len(pareto_individuals)} solutions; key selection candidates highlighted",
+                 fontweight="bold", pad=10)
+    ax.legend(loc="best", frameon=True, fancybox=True, shadow=True, fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(filepath, dpi=150)
