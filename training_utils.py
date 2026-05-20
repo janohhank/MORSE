@@ -126,36 +126,35 @@ def plot_pareto_front(pareto_individuals: list, filepath: str) -> None:
     if other_mask.any():
         ax.scatter(auc_vals[other_mask], sign_vals[other_mask],
                    c="lightsteelblue", alpha=0.75, edgecolors="black", s=55,
-                   label=f"Other Pareto points (n={int(other_mask.sum())})",
+                   label=f"Other Pareto points",
                    zorder=2)
 
     # Highlight: best AUC (green triangle) -- only if distinct from the others.
     if best_auc_idx != knee_idx and best_auc_idx != best_sign_idx:
         ax.scatter(auc_vals[best_auc_idx], sign_vals[best_auc_idx],
-                   c="tab:green", edgecolors="black", linewidths=1.4,
-                   s=200, marker="^", zorder=4,
+                   c="tab:green", edgecolors="black", linewidths=1.0,
+                   s=120, marker="^", zorder=4,
                    label=f"Best AUC ({auc_vals[best_auc_idx]:.4f}, "
                          f"{sign_vals[best_auc_idx]:.4f})")
 
     # Highlight: best sign-consistency (orange diamond) -- only if distinct from knee.
     if best_sign_idx != knee_idx:
         ax.scatter(auc_vals[best_sign_idx], sign_vals[best_sign_idx],
-                   c="tab:orange", edgecolors="black", linewidths=1.4,
-                   s=200, marker="D", zorder=5,
+                   c="tab:orange", edgecolors="black", linewidths=1.0,
+                   s=100, marker="D", zorder=5,
                    label=f"Best sign-consistency ({auc_vals[best_sign_idx]:.4f}, "
                          f"{sign_vals[best_sign_idx]:.4f})")
 
     # Highlight: knee point (red star) -- always drawn on top with the largest marker.
     ax.scatter(auc_vals[knee_idx], sign_vals[knee_idx],
-               c="tab:red", edgecolors="black", linewidths=1.4,
-               s=320, marker="*", zorder=6,
+               c="tab:cyan", edgecolors="black", linewidths=1.0,
+               s=120, marker="*", zorder=6,
                label=f"Knee point ({auc_vals[knee_idx]:.4f}, "
                      f"{sign_vals[knee_idx]:.4f})")
 
     ax.set_xlabel("AUC", fontweight="bold")
     ax.set_ylabel("Sign Consistency", fontweight="bold")
-    ax.set_title(f"Pareto Front (AUC vs Sign Consistency)\n"
-                 f"{len(pareto_individuals)} solutions; key selection candidates highlighted",
+    ax.set_title("Pareto Front (AUC vs Sign Consistency)",
                  fontweight="bold", pad=10)
     ax.legend(loc="best", frameon=True, fancybox=True, shadow=True, fontsize=9)
     ax.grid(True, alpha=0.3)
