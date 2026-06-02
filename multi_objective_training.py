@@ -9,6 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from training_config import TrainingConfig
 from training_utils import save_stats_csv, plot_multi_objective_convergence, plot_pareto_front
+from evaluation_utils import compute_sign_consistency_score
 from deap import base, creator, tools
 
 class MultiObjectiveTraining:
@@ -54,7 +55,6 @@ class MultiObjectiveTraining:
             return 0.0, 0.0
 
         cols: numpy.ndarray = numpy.where(numpy.array(individual) == 1)[0]
-        n_selected_features: int = len(cols)
 
         auc_scores: list[float] = []
         sign_scores: list[float] = []
@@ -79,17 +79,10 @@ class MultiObjectiveTraining:
                 fold_auc: float = average_precision_score(y_fold_val, probs)
             auc_scores.append(fold_auc)
 
-            # Get the correlation coefficients for the selected features in the current fold
+            # Sign-consistency for this fold: shared definition with the
+            # post-hoc verification report (see compute_sign_consistency_score).
             fold_corr: numpy.ndarray = self._corr_matrix[fold_idx, cols]
-
-            # Multiply the correlation coefficients with the logistic regression coefficients
-            check: numpy.ndarray = fold_corr * model.coef_[0]
-
-            # Count penalties (where the product is negative or close to zero)
-            penalties: int = numpy.sum((check < 0) | numpy.isclose(check, 0.0, atol=1e-12))
-
-            # Calculate the score
-            fold_sign: float = 1.0 - (penalties / n_selected_features)
+            fold_sign: float = compute_sign_consistency_score(model.coef_[0], fold_corr)
             sign_scores.append(fold_sign)
 
         return numpy.mean(auc_scores), numpy.mean(sign_scores)

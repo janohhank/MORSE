@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any
+from typing import Any, Union
 
 import numpy
 import pandas
@@ -10,13 +10,84 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.stats import pointbiserialr
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from training_utils import ensure_directory
+
+
+# ---------------------------------------------------------------------------
+# Marginal correlations + sign-consistency primitives
+# Shared by the multi-objective GA fitness (multi_objective_training.py) and
+# the post-hoc verification / sign-inconsistency reports in the notebook.
+# ---------------------------------------------------------------------------
+
+def compute_marginal_correlations(
+    X: Union[numpy.ndarray, pandas.DataFrame],
+    y: Union[numpy.ndarray, pandas.Series],
+) -> numpy.ndarray:
+    """Per-feature marginal correlation with the binary target `y`.
+
+    Uses Matthews correlation when a column has exactly two unique values
+    (and is therefore effectively binary), point-biserial correlation when
+    a column has more than two unique values, and 0 for constant columns.
+
+    Returns a numpy array of length `X.shape[1]`, aligned with the column
+    order of `X`. Numerically identical to the inline loops previously
+    embedded in cells 5, 18 and 30 of training_notebook.ipynb.
+    """
+    X_arr: numpy.ndarray = X.to_numpy() if hasattr(X, "to_numpy") else numpy.asarray(X)
+    y_int: numpy.ndarray = numpy.asarray(y, dtype=int)
+    n_features: int = X_arr.shape[1]
+
+    out: numpy.ndarray = numpy.zeros(n_features, dtype=float)
+    for j in range(n_features):
+        feat: numpy.ndarray = X_arr[:, j]
+        u: int = len(numpy.unique(feat))
+        if u <= 1:
+            out[j] = 0.0
+        elif u == 2:
+            out[j] = float(matthews_corrcoef(y_int, feat.astype(int)))
+        else:
+            corr, _ = pointbiserialr(y_int, feat)
+            out[j] = float(corr)
+    return out
+
+
+def compute_sign_consistency_score(
+    coefficients: numpy.ndarray,
+    correlations: numpy.ndarray,
+    zero_atol: float = 1e-12,
+) -> float:
+    """Sign-consistency score in [0, 1] for a fitted model.
+
+    A feature contributes a penalty when its (marginal correlation x model
+    coefficient) product is negative OR approximately zero (within `zero_atol`).
+    The score is `1 - penalised_fraction`.
+
+    This is the canonical definition used both as the second objective of the
+    multi-objective GA (per fold inside MultiObjectiveTraining) and as the
+    post-hoc verification metric in the fold-vs-full-train report. Keeping
+    a single definition here removes the risk of the two paths drifting
+    apart.
+    """
+    coefs: numpy.ndarray = numpy.asarray(coefficients).ravel()
+    corrs: numpy.ndarray = numpy.asarray(correlations).ravel()
+    n: int = int(coefs.shape[0])
+    if n == 0:
+        return 0.0
+    if corrs.shape[0] != n:
+        raise ValueError(
+            f"coefficients and correlations must have equal length, "
+            f"got {n} vs {corrs.shape[0]}"
+        )
+    check: numpy.ndarray = corrs * coefs
+    penalties: int = int(numpy.sum((check < 0) | numpy.isclose(check, 0.0, atol=zero_atol)))
+    return 1.0 - penalties / n
 
 
 # ---------------------------------------------------------------------------
