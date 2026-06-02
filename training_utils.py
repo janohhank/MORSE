@@ -1,65 +1,14 @@
 import csv
 import os
-import time
-from typing import Callable, TypeVar
 
 import numpy
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-_T = TypeVar("_T")
-
 
 def ensure_directory(directory: str) -> None:
     os.makedirs(directory, exist_ok=True)
-
-
-def parallel_per_seed(
-    seeds: list[int],
-    worker_fn: Callable[[int], _T],
-    *,
-    n_jobs: int = -1,
-    label: str = "task",
-) -> list[_T]:
-    """Run `worker_fn(seed)` for every seed and return the results in submission order.
-
-    - n_jobs == 1: pure sequential loop. Tracebacks stay attached to the calling
-      kernel; convenient for debugging.
-    - n_jobs != 1: dispatch through joblib's loky backend with
-      `return_as="generator"` so the parent prints a rolling progress + ETA
-      line every time a worker finishes.
-
-    Numerical results are independent of `n_jobs` by construction: each seed
-    must be self-contained, i.e. `worker_fn` must not share mutable state
-    across calls.
-    """
-    overall_start: float = time.time()
-    n_seeds: int = len(seeds)
-    print(f"{label}: {n_seeds} seeds (n_jobs={n_jobs})...", flush=True)
-
-    results: list[_T] = []
-    if n_jobs == 1:
-        for i, s in enumerate(seeds, 1):
-            results.append(worker_fn(s))
-            el: float = time.time() - overall_start
-            print(f"  Progress: {i}/{n_seeds} | elapsed {el/60:6.1f} min | "
-                  f"avg {el/i/60:5.1f} min/seed", flush=True)
-    else:
-        from joblib import Parallel, delayed
-        parallel = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")
-        gen = parallel(delayed(worker_fn)(s) for s in seeds)
-        for i, r in enumerate(gen, 1):
-            results.append(r)
-            el = time.time() - overall_start
-            eta = el / i * (n_seeds - i)
-            print(f"  Progress: {i}/{n_seeds} | elapsed {el/60:6.1f} min | "
-                  f"avg {el/i/60:5.1f} min/seed | ETA ~{eta/60:5.1f} min",
-                  flush=True)
-
-    total_min: float = (time.time() - overall_start) / 60.0
-    print(f"{label}: all {n_seeds} seeds finished in {total_min:.1f} min", flush=True)
-    return results
 
 
 def _apply_plot_theme() -> None:
