@@ -1,6 +1,6 @@
 # MORSE
 
-**M**ulti-**o**bjective Optimization with **R**obust **S**election of **E**xplanatory variables.
+**M**ulti-objective **O**ptimization with **R**obust **S**election of **E**xplanatory variables.
 
 A reference implementation and full empirical study of a **sign-consistency-aware
 feature selection framework** for logistic regression, built on the NSGA-II
