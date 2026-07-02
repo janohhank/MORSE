@@ -6,6 +6,7 @@ from typing import Sequence, Any
 
 import numpy
 from numpy import floating
+from deap import base, creator, tools
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -13,23 +14,11 @@ from sklearn.preprocessing import StandardScaler
 
 from training_config import TrainingConfig
 from training_utils import save_stats_csv, plot_multi_objective_convergence, plot_pareto_front
-from deap import base, creator, tools
 
 
 class MultiObjectiveTraining:
-    """NSGA-II GA that co-optimises AUC and sign-consistency over binary
+    """NSGA-II GA that co-optimises ROC/PR-AUC and sign-consistency over binary
     feature-subset masks.
-
-    The class now owns the fold preparation: given the raw training arrays,
-    a `StratifiedKFold` splitter and the *pre-computed full-train marginal
-    correlations*, it materialises the per-fold scaled arrays internally on
-    first use. Callers no longer have to shuttle around six parallel lists
-    of per-fold arrays.
-
-    The sign-consistency check uses one correlation value per feature,
-    computed on the full training set, rather than a per-fold correlation
-    matrix. This decouples the sign-consistency reference from the CV split
-    the GA happens to see.
     """
 
     def __init__(self,

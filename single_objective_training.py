@@ -18,10 +18,6 @@ from training_utils import save_stats_csv, plot_single_objective_convergence
 
 class SingleObjectiveTraining:
     """Single-objective AUC-only GA baseline (DEAP `eaMuPlusLambda`).
-
-    Owns its own fold materialisation (scaler fit-per-fold on the fold's
-    training partition); callers pass the raw training arrays and a
-    `StratifiedKFold` splitter instead of pre-computed per-fold lists.
     """
 
     def __init__(self,
