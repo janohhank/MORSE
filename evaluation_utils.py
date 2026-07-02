@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any
+from typing import Any, Union
 
 import numpy
 import pandas
@@ -10,13 +10,45 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.stats import pointbiserialr
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from training_utils import ensure_directory
+
+
+def compute_marginal_correlations(
+    X: Union[numpy.ndarray, pandas.DataFrame],
+    y: Union[numpy.ndarray, pandas.Series],
+) -> numpy.ndarray:
+    """Per-feature marginal correlation with the binary target `y`.
+
+    - Matthews correlation for columns with exactly 2 unique values.
+    - Point-biserial correlation for columns with more than 2 unique values.
+    - 0 for constant columns.
+
+    Returns a numpy array of length `X.shape[1]`, aligned with the column
+    order of `X`.
+    """
+    X_arr: numpy.ndarray = X.to_numpy() if hasattr(X, "to_numpy") else numpy.asarray(X)
+    y_int: numpy.ndarray = numpy.asarray(y, dtype=int)
+    n_features: int = X_arr.shape[1]
+
+    out: numpy.ndarray = numpy.zeros(n_features, dtype=float)
+    for j in range(n_features):
+        feat: numpy.ndarray = X_arr[:, j]
+        u: int = len(numpy.unique(feat))
+        if u <= 1:
+            out[j] = 0.0
+        elif u == 2:
+            out[j] = float(matthews_corrcoef(y_int, feat.astype(int)))
+        else:
+            corr, _ = pointbiserialr(y_int, feat)
+            out[j] = float(corr)
+    return out
 
 
 # ---------------------------------------------------------------------------
