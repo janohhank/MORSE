@@ -12,7 +12,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from training_config import TrainingConfig
-from training_utils import save_stats_csv, plot_multi_objective_convergence, plot_pareto_front
+from training_utils import save_stats_csv
+from plot_utils import plot_multi_objective_convergence, plot_pareto_front
 from evaluation_utils import compute_marginal_correlations
 
 

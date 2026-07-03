@@ -1,32 +1,26 @@
+"""Small, dependency-light utilities used by the GA training classes and
+the notebook.
+
+Only functions that are actually referenced by the current
+`training_notebook.ipynb` (directly or transitively through the training
+classes) live here. All plotting code has moved to `plot_utils.py`.
+"""
 import csv
 import os
 
 import numpy
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 def ensure_directory(directory: str) -> None:
+    """Create a directory (and any missing parents) if it doesn't exist."""
     os.makedirs(directory, exist_ok=True)
 
 
-def _apply_plot_theme() -> None:
-    """Set a clean white-background, black-text theme for all plots."""
-    plt.rcParams.update({
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-        "savefig.facecolor": "white",
-        "text.color": "black",
-        "axes.labelcolor": "black",
-        "xtick.color": "black",
-        "ytick.color": "black",
-        "axes.edgecolor": "black",
-        "grid.color": "#cccccc",
-    })
-
-
 def save_stats_csv(stats: list[dict], filepath: str) -> None:
+    """Persist a list of homogeneous dict rows as a CSV file. Used by the
+    single- and multi-objective GA training classes to save per-generation
+    statistics.
+    """
     if not stats:
         return
     ensure_directory(os.path.dirname(filepath))
@@ -34,146 +28,6 @@ def save_stats_csv(stats: list[dict], filepath: str) -> None:
         writer: csv.DictWriter = csv.DictWriter(f, fieldnames=stats[0].keys())
         writer.writeheader()
         writer.writerows(stats)
-
-
-def plot_single_objective_convergence(stats: list[dict], filepath: str) -> None:
-    ensure_directory(os.path.dirname(filepath))
-    gens: list[int] = [s["gen"] for s in stats]
-    max_vals: list[float] = [s["max"] for s in stats]
-    avg_vals: list[float] = [s["avg"] for s in stats]
-
-    _apply_plot_theme()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(gens, max_vals, label="Max", linewidth=2)
-    ax.plot(gens, avg_vals, label="Avg", linewidth=2, linestyle="--")
-    if "min" in stats[0]:
-        ax.fill_between(gens,
-                         [s["min"] for s in stats],
-                         max_vals,
-                         alpha=0.15, label="Min-Max range")
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("Fitness (AUC)")
-    ax.set_title("Single-Objective GA Convergence")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(filepath, dpi=150)
-    plt.close(fig)
-
-
-def plot_multi_objective_convergence(stats: list[dict], filepath: str) -> None:
-    ensure_directory(os.path.dirname(filepath))
-    gens: list[int] = [s["gen"] for s in stats]
-
-    _apply_plot_theme()
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    # AUC convergence
-    axes[0].plot(gens, [s["auc_max"] for s in stats], label="Max", linewidth=2)
-    axes[0].plot(gens, [s["auc_mean"] for s in stats], label="Mean", linewidth=2, linestyle="--")
-    axes[0].set_xlabel("Generation")
-    axes[0].set_ylabel("AUC")
-    axes[0].set_title("AUC Convergence")
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # Sign consistency convergence
-    axes[1].plot(gens, [s["sign_max"] for s in stats], label="Max", linewidth=2)
-    axes[1].plot(gens, [s["sign_mean"] for s in stats], label="Mean", linewidth=2, linestyle="--")
-    axes[1].set_xlabel("Generation")
-    axes[1].set_ylabel("Sign Consistency")
-    axes[1].set_title("Sign Consistency Convergence")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    # Pareto front size
-    axes[2].plot(gens, [s["pareto_size"] for s in stats], linewidth=2, color="green")
-    axes[2].set_xlabel("Generation")
-    axes[2].set_ylabel("Pareto Front Size")
-    axes[2].set_title("Pareto Front Size")
-    axes[2].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(filepath, dpi=150)
-    plt.close(fig)
-
-
-def plot_pareto_front(pareto_individuals: list, filepath: str) -> None:
-    """Plot the Pareto front and highlight the three canonical model-selection
-    candidates: the knee point (balanced trade-off), the best sign-consistency
-    point, and the best AUC point. All other Pareto solutions are shown in a
-    muted neutral colour so the highlighted markers stand out."""
-    ensure_directory(os.path.dirname(filepath))
-    auc_vals: numpy.ndarray = numpy.array(
-        [ind.fitness.values[0] for ind in pareto_individuals], dtype=float)
-    sign_vals: numpy.ndarray = numpy.array(
-        [ind.fitness.values[1] for ind in pareto_individuals], dtype=float)
-
-    # Resolve the three canonical selection indices. These helpers handle
-    # edge cases (single-point fronts, coincident endpoints) themselves.
-    knee_idx: int = knee_point_index(pareto_individuals)
-    best_sign_idx: int = best_sign_consistency_index(pareto_individuals)
-    best_auc_idx: int = best_auc_index(pareto_individuals)
-
-    # Filter the background scatter by FITNESS COORDINATE, not by index, so
-    # that any Pareto individual whose (AUC, sign-consistency) tuple equals a
-    # highlighted candidate's is suppressed too. Without this, the GA's
-    # population convergence (multiple individuals collapsing to the same
-    # fitness tuple) produces "ghost" background points sitting exactly under
-    # the highlight markers.
-    highlight_coords: set[tuple[float, float]] = {
-        (float(auc_vals[knee_idx]),      float(sign_vals[knee_idx])),
-        (float(auc_vals[best_sign_idx]), float(sign_vals[best_sign_idx])),
-        (float(auc_vals[best_auc_idx]),  float(sign_vals[best_auc_idx])),
-    }
-    other_mask: numpy.ndarray = numpy.array(
-        [(float(auc_vals[i]), float(sign_vals[i])) not in highlight_coords
-         for i in range(len(pareto_individuals))],
-        dtype=bool,
-    )
-
-    _apply_plot_theme()
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    # Background: all other Pareto solutions in the original royalblue.
-    if other_mask.any():
-        ax.scatter(auc_vals[other_mask], sign_vals[other_mask],
-                   c="royalblue", alpha=0.75, edgecolors="black", s=55,
-                   label="Other Pareto points",
-                   zorder=2)
-
-    # Highlight: best AUC (green triangle) -- only if distinct from the others.
-    if best_auc_idx != knee_idx and best_auc_idx != best_sign_idx:
-        ax.scatter(auc_vals[best_auc_idx], sign_vals[best_auc_idx],
-                   c="tab:green", edgecolors="black", linewidths=1.0,
-                   s=120, marker="^", zorder=4,
-                   label=f"Best AUC ({auc_vals[best_auc_idx]:.4f}, "
-                         f"{sign_vals[best_auc_idx]:.4f})")
-
-    # Highlight: best sign-consistency (orange diamond) -- only if distinct from knee.
-    if best_sign_idx != knee_idx:
-        ax.scatter(auc_vals[best_sign_idx], sign_vals[best_sign_idx],
-                   c="tab:orange", edgecolors="black", linewidths=1.0,
-                   s=100, marker="D", zorder=5,
-                   label=f"Best sign-consistency ({auc_vals[best_sign_idx]:.4f}, "
-                         f"{sign_vals[best_sign_idx]:.4f})")
-
-    # Highlight: knee point (red star) -- always drawn on top with the largest marker.
-    ax.scatter(auc_vals[knee_idx], sign_vals[knee_idx],
-               c="tab:cyan", edgecolors="black", linewidths=1.0,
-               s=120, marker="*", zorder=6,
-               label=f"Knee point ({auc_vals[knee_idx]:.4f}, "
-                     f"{sign_vals[knee_idx]:.4f})")
-
-    ax.set_xlabel("AUC", fontweight="bold")
-    ax.set_ylabel("Sign Consistency", fontweight="bold")
-    ax.set_title("Pareto Front (AUC vs Sign Consistency)",
-                 fontweight="bold", pad=10)
-    ax.legend(loc="best", frameon=True, fancybox=True, shadow=True, fontsize=9)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(filepath, dpi=150)
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

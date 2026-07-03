@@ -12,7 +12,8 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import StratifiedKFold
 
 from training_config import TrainingConfig
-from training_utils import save_stats_csv, plot_single_objective_convergence
+from training_utils import save_stats_csv
+from plot_utils import plot_single_objective_convergence
 
 
 class SingleObjectiveTraining:
