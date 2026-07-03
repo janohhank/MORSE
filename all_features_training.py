@@ -7,7 +7,7 @@ class AllFeaturesTraining:
     """No-feature-selection baseline.
 
     Trivially returns the all-ones bit-vector. Kept as an explicit class so
-    that the per-seed training loop can call all four methods --
+    that the per-seed training loop can call all compared methods --
     MultiObjectiveTraining, SingleObjectiveTraining, ForwardStepwiseTraining
     and AllFeaturesTraining -- through the same `.run()` shape and populate
     the same `training_results_*` dictionaries.
