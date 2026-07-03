@@ -10,7 +10,6 @@ from deap import base, creator, tools
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
 
 from training_config import TrainingConfig
 from training_utils import save_stats_csv, plot_multi_objective_convergence, plot_pareto_front
@@ -46,8 +45,7 @@ class MultiObjectiveTraining:
         self._cache.clear()
 
     def _ensure_folds(self) -> None:
-        """Materialise the CV folds on demand (scaler fit-per-fold on the
-        fold's training partition, no leakage across folds)."""
+        """Materialise the CV folds on demand."""
         if self._folds is not None:
             return
 
@@ -58,11 +56,7 @@ class MultiObjectiveTraining:
             y_fold_train: numpy.ndarray = self._y_train[train_idx]
             y_fold_val: numpy.ndarray = self._y_train[val_idx]
 
-            scaler: StandardScaler = StandardScaler()
-            X_fold_train_scaled: numpy.ndarray = scaler.fit_transform(X_fold_train)
-            X_fold_val_scaled: numpy.ndarray = scaler.transform(X_fold_val)
-
-            folds.append((X_fold_train_scaled, X_fold_val_scaled, y_fold_train, y_fold_val))
+            folds.append((X_fold_train, X_fold_val, y_fold_train, y_fold_val))
         self._folds = folds
 
     def evaluate_multi(self, individual: Sequence[int]) -> tuple[float, float]:

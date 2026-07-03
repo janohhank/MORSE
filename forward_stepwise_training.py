@@ -5,7 +5,6 @@ from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from training_config import TrainingConfig
 
@@ -20,8 +19,7 @@ class ForwardStepwiseTraining:
 
         result = ForwardStepwiseTraining(...).run()
 
-    The wrapped SFS operates on a `Pipeline(StandardScaler, LR)` so the
-    scaler is refit on each inner CV fold (no leakage across folds).
+    Refit on each inner CV fold (no leakage across folds).
 
     `inner_n_jobs` maps to sklearn's `n_jobs` for SFS's own CV; it should be
     forced to 1 when the outer seed pool is parallel (loky x sklearn would
@@ -45,7 +43,6 @@ class ForwardStepwiseTraining:
         (list[int], values in {0, 1}) aligned with the column order of
         `X_train`."""
         pipe: Pipeline = Pipeline([
-            ("scaler", StandardScaler()),
             ("lr", LogisticRegression(
                 penalty="l2", solver="lbfgs",
                 max_iter=1000, random_state=self._config.seed)),

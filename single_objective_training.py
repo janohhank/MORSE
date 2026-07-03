@@ -10,7 +10,6 @@ from numpy import floating
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
 
 from training_config import TrainingConfig
 from training_utils import save_stats_csv, plot_single_objective_convergence
@@ -52,11 +51,7 @@ class SingleObjectiveTraining:
             y_fold_train: numpy.ndarray = self._y_train[train_idx]
             y_fold_val: numpy.ndarray = self._y_train[val_idx]
 
-            scaler: StandardScaler = StandardScaler()
-            X_fold_train_scaled: numpy.ndarray = scaler.fit_transform(X_fold_train)
-            X_fold_val_scaled: numpy.ndarray = scaler.transform(X_fold_val)
-
-            folds.append((X_fold_train_scaled, X_fold_val_scaled, y_fold_train, y_fold_val))
+            folds.append((X_fold_train, X_fold_val, y_fold_train, y_fold_val))
         self._folds = folds
 
     def evaluate_single(self, individual: Sequence[int]) -> tuple[float]:
