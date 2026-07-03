@@ -13,6 +13,7 @@ from sklearn.model_selection import StratifiedKFold
 
 from training_config import TrainingConfig
 from training_utils import save_stats_csv, plot_multi_objective_convergence, plot_pareto_front
+from evaluation_utils import compute_marginal_correlations
 
 
 class MultiObjectiveTraining:
@@ -25,18 +26,24 @@ class MultiObjectiveTraining:
                  feature_names: list[str],
                  X_train: numpy.ndarray,
                  y_train: numpy.ndarray,
-                 cv: StratifiedKFold,
-                 corr_array: numpy.ndarray) -> None:
+                 cv: StratifiedKFold) -> None:
         self._config: TrainingConfig = config
         self._feature_names: list[str] = feature_names
         self._X_train: numpy.ndarray = X_train
         self._y_train: numpy.ndarray = y_train
         self._cv: StratifiedKFold = cv
-        self._corr_array: numpy.ndarray = corr_array
 
         # Per-fold materialisation is lazy: the first call to _evaluate_multi
-        # builds the (scaled_train, scaled_val, y_train, y_val) tuples once.
+        # builds the (X_fold_train, X_fold_val, y_fold_train, y_fold_val)
+        # tuples AND the fold-level marginal correlation arrays once.
         self._folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] | None = None
+        # Per-fold marginal-correlation arrays; index-aligned with self._folds.
+        # Computed on each fold's TRAINING partition -- the same data slice the
+        # per-fold LR coefficients are fitted on. Keeping both estimators on
+        # the same slice keeps the sign-consistency fitness (a) leakage-free
+        # -- no validation-partition information enters the fitness -- and
+        # (b) an unbiased CV estimate of the out-of-sample sign agreement.
+        self._fold_corrs: list[numpy.ndarray] | None = None
 
         # Per-instance evaluation cache.
         self._cache: dict[tuple[int, ...], tuple[float, float]] = {}
@@ -45,11 +52,27 @@ class MultiObjectiveTraining:
         self._cache.clear()
 
     def _ensure_folds(self) -> None:
-        """Materialise the CV folds on demand."""
+        """Materialise the CV folds AND their per-fold marginal correlations
+        on demand.
+
+        Per-fold correlations are computed on the fold's TRAINING partition
+        only, i.e. the same data that the fold's LR coefficients are fitted
+        on. This is the methodologically correct pairing:
+
+          * `sign(fold_corr) == sign(fold_beta)` measures whether the two
+            estimators agree on the SAME sample slice -- an unbiased CV
+            estimate of the population-level sign agreement.
+          * Using a full-train correlation reference instead would leak
+            validation-partition information into the fitness function
+            (the same rows are held out from the LR fit but contribute
+            to the correlation reference), which is a subtle but real
+            metholodogical flaw.
+        """
         if self._folds is not None:
             return
 
         folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] = []
+        fold_corrs: list[numpy.ndarray] = []
         for train_idx, val_idx in self._cv.split(self._X_train, self._y_train):
             X_fold_train: numpy.ndarray = self._X_train[train_idx]
             X_fold_val: numpy.ndarray = self._X_train[val_idx]
@@ -57,7 +80,9 @@ class MultiObjectiveTraining:
             y_fold_val: numpy.ndarray = self._y_train[val_idx]
 
             folds.append((X_fold_train, X_fold_val, y_fold_train, y_fold_val))
+            fold_corrs.append(compute_marginal_correlations(X_fold_train, y_fold_train))
         self._folds = folds
+        self._fold_corrs = fold_corrs
 
     def evaluate_multi(self, individual: Sequence[int]) -> tuple[float, float]:
         key: tuple[int, ...] = tuple(individual)
@@ -75,14 +100,12 @@ class MultiObjectiveTraining:
 
         cols: numpy.ndarray = numpy.where(numpy.array(individual) == 1)[0]
         n_selected_features: int = len(cols)
-        # Sign-consistency reference is the full-train correlation array; a
-        # single value per feature, shared across all CV folds.
-        selected_corr: numpy.ndarray = self._corr_array[cols]
 
         auc_scores: list[float] = []
         sign_scores: list[float] = []
 
-        for X_fold_train_scaled, X_fold_val_scaled, y_fold_train, y_fold_val in self._folds:
+        for (X_fold_train_scaled, X_fold_val_scaled, y_fold_train, y_fold_val), fold_corr in zip(
+                self._folds, self._fold_corrs):
             X_fold_train_sub: numpy.ndarray = X_fold_train_scaled[:, cols]
             X_fold_val_sub: numpy.ndarray = X_fold_val_scaled[:, cols]
 
@@ -100,9 +123,12 @@ class MultiObjectiveTraining:
                 fold_auc: float = average_precision_score(y_fold_val, probs)
             auc_scores.append(fold_auc)
 
-            # Sign-consistency: agreement between the full-train correlation
-            # sign and the fold-fitted coefficient sign, per selected feature.
-            check: numpy.ndarray = selected_corr * model.coef_[0]
+            # Sign-consistency: per-fold agreement between the fold-computed
+            # marginal correlation sign and the fold-fitted coefficient sign
+            # for the selected features -- both estimators use the same fold
+            # training partition, so the check is leakage-free.
+            selected_fold_corr: numpy.ndarray = fold_corr[cols]
+            check: numpy.ndarray = selected_fold_corr * model.coef_[0]
             penalties: int = numpy.sum((check < 0) | numpy.isclose(check, 0.0, atol=1e-12))
             fold_sign: float = 1.0 - (penalties / n_selected_features)
             sign_scores.append(fold_sign)
