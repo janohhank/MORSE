@@ -294,6 +294,53 @@ def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Balanced sensitivity / specificity curve for the deployed model
+# ---------------------------------------------------------------------------
+
+def plot_specificity_sensitivity_curve(sorted_scores: numpy.ndarray,
+                                       sensitivity_curve: numpy.ndarray,
+                                       specificity_curve: numpy.ndarray,
+                                       intersection_idx: int,
+                                       out_path: str) -> None:
+    """Render the sensitivity and specificity curves as functions of the
+    classification threshold rank, and mark the balanced (Sens ≈ Spec)
+    threshold with a square marker + legend annotation.
+
+    Consumes the output of `evaluation_utils.find_balanced_threshold`. Saves
+    a PDF for high-quality inclusion in the paper.
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+
+    n: int = len(sorted_scores)
+    crossover_value: float = float(sorted_scores[intersection_idx])
+    crossover_sens: float = float(sensitivity_curve[intersection_idx])
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(range(1, n + 1), specificity_curve,
+            label="Specificity", color="green", linestyle="-")
+    ax.plot(range(1, n + 1), sensitivity_curve,
+            label="Sensitivity", color="blue", linestyle="--")
+    ax.scatter(intersection_idx + 1, crossover_sens,
+               color="green", marker="s", zorder=5,
+               label=(f"Balanced Sens/Spec = {crossover_sens:.4f}\n"
+                      f"Threshold = {crossover_value:.4f}"))
+    ax.set_xlabel("Threshold rank (low -> high)")
+    ax.set_ylabel("Sensitivity / Specificity")
+    ax.set_ylim(0, 1)
+    ax.set_xlim(1, n)
+    ax.set_xticks([1, n])
+    ax.set_xticklabels(["Lowest threshold", "Highest threshold"])
+    ax.set_title("Specificity and Sensitivity curve", fontweight="bold", pad=10)
+    ax.legend(loc="lower right", frameon=True, fancybox=True, shadow=True)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    fig.savefig(out_path, format="pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Model-parsimony plot
 # ---------------------------------------------------------------------------
 

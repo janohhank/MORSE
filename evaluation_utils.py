@@ -189,3 +189,71 @@ def evaluate_model(
     if use_roc_auc:
         return float(roc_auc_score(y_test, y_prob))
     return float(average_precision_score(y_test, y_prob))
+
+
+# ---------------------------------------------------------------------------
+# Balanced sensitivity / specificity threshold
+# ---------------------------------------------------------------------------
+
+def find_balanced_threshold(
+        y_test: Union[numpy.ndarray, pandas.Series],
+        y_probs: Union[numpy.ndarray, pandas.Series]) -> dict[str, Any]:
+    """Find the classification threshold at which sensitivity is closest to
+    specificity.
+
+    Sweeps all possible thresholds (each `y_probs` value acts as a cut-off,
+    lowest first). At every candidate threshold we compute the confusion
+    matrix, then sensitivity and specificity. The threshold with the smallest
+    absolute (sensitivity - specificity) gap is returned, along with the full
+    curves for plotting and the corresponding binary predictions.
+
+    Returns a dict with keys:
+      - `threshold`         : the balanced cut-off value.
+      - `sensitivity`       : sensitivity at that threshold.
+      - `specificity`       : specificity at that threshold.
+      - `intersection_idx`  : the sorted-index of the balanced threshold.
+      - `sorted_scores`     : the sorted y_probs array.
+      - `sensitivity_curve` : per-threshold sensitivity (same length as scores).
+      - `specificity_curve` : per-threshold specificity (same length as scores).
+      - `y_pred`            : binary predictions using the balanced threshold.
+    """
+    y_true: numpy.ndarray = numpy.asarray(y_test).astype(int)
+    y_probs_np: numpy.ndarray = numpy.asarray(y_probs, dtype=float)
+
+    sorted_indices: numpy.ndarray = numpy.argsort(y_probs_np)
+    sorted_scores: numpy.ndarray = y_probs_np[sorted_indices]
+    sorted_y_true: numpy.ndarray = y_true[sorted_indices]
+
+    n: int = len(y_true)
+    sensitivity: numpy.ndarray = numpy.zeros(n)
+    specificity: numpy.ndarray = numpy.zeros(n)
+
+    for i in range(n):
+        predicted_positive: numpy.ndarray = numpy.zeros(n)
+        predicted_positive[i:] = 1
+
+        tp: int = int(numpy.sum((predicted_positive == 1) & (sorted_y_true == 1)))
+        fn: int = int(numpy.sum((predicted_positive == 0) & (sorted_y_true == 1)))
+        tn: int = int(numpy.sum((predicted_positive == 0) & (sorted_y_true == 0)))
+        fp: int = int(numpy.sum((predicted_positive == 1) & (sorted_y_true == 0)))
+
+        sensitivity[i] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity[i] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    diff: numpy.ndarray = numpy.abs(sensitivity - specificity)
+    intersection_idx: int = int(numpy.argmin(diff))
+    threshold: float = float(sorted_scores[intersection_idx])
+
+    # Binary predictions on the ORIGINAL (unsorted) probability vector.
+    y_pred: numpy.ndarray = (y_probs_np >= threshold).astype(int)
+
+    return {
+        "threshold":         threshold,
+        "sensitivity":       float(sensitivity[intersection_idx]),
+        "specificity":       float(specificity[intersection_idx]),
+        "intersection_idx":  intersection_idx,
+        "sorted_scores":     sorted_scores,
+        "sensitivity_curve": sensitivity,
+        "specificity_curve": specificity,
+        "y_pred":            y_pred,
+    }
