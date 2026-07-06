@@ -4,18 +4,6 @@ All figures produced by the training + evaluation pipeline are generated
 here. Every plotting function applies the shared theme via
 `_apply_plot_theme()` so the output has a consistent look-and-feel
 (white background, black text, subtle grid lines).
-
-Contents:
-  * `_apply_plot_theme` -- shared matplotlib + seaborn theme.
-  * GA convergence plots
-      - `plot_single_objective_convergence`
-      - `plot_multi_objective_convergence`
-      - `plot_pareto_front`
-  * All-models noise-robustness plots
-      - `plot_noise_comparison`         (1D line plot with mean + std band)
-      - `plot_2d_heatmap_grid`          (2x2 grid of shared-scale heatmaps)
-  * Model-parsimony plot
-      - `plot_feature_count_comparison` (boxplot + stripplot overlay)
 """
 from __future__ import annotations
 

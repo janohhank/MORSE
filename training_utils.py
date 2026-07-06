@@ -1,9 +1,5 @@
 """Small, dependency-light utilities used by the GA training classes and
 the notebook.
-
-Only functions that are actually referenced by the current
-`training_notebook.ipynb` (directly or transitively through the training
-classes) live here. All plotting code has moved to `plot_utils.py`.
 """
 import csv
 import os
