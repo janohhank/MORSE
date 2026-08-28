@@ -50,6 +50,15 @@ class ForwardStepwiseTraining:
 
         sfs: SequentialFeatureSelector = SequentialFeatureSelector(
             pipe,
+            n_features_to_select="auto",
+            # With n_features_to_select="auto", scikit-learn only applies a
+            # tol-based stopping rule (keep adding features while the CV
+            # score improves by more than `tol`) when `tol` is explicitly
+            # set. Leaving `tol=None` (the default) silently falls back to
+            # selecting a FIXED n_features // 2, regardless of whether those
+            # features still help -- not the adaptive baseline this class is
+            # meant to provide.
+            tol=1e-3,
             direction="forward",
             scoring="roc_auc" if self._config.use_roc_auc else "average_precision",
             cv=self._cv,
