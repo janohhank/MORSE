@@ -1,0 +1,23 @@
+# MORSE runtime dependencies.
+#
+# Python >= 3.10 is required (the code uses PEP 604 `X | None` unions and
+# PEP 585 builtin generics such as `list[str]`).
+#
+# These are the reference pins the pipeline is developed and validated
+# against: a coherent, mutually compatible scientific-Python stack. numpy is
+# held < 2.0 for compatibility with the pinned deap release. Install with:
+#
+#     python -m pip install -r requirements.txt
+#
+# Only these eight third-party packages are imported anywhere in the code
+# base (statsmodels is intentionally NOT a dependency: the VIF analysis that
+# once required it is no longer part of the pipeline).
+
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+matplotlib==3.9.2
+seaborn==0.13.2
+deap==1.4.1
+joblib==1.4.2

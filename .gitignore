@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# IDEs
+.idea/
+.vscode/
+
+# Timestamped pipeline output directories (YYYY-MM-DD_HH-MM-SS/)
+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
