@@ -257,3 +257,146 @@ def find_balanced_threshold(
         "specificity_curve": specificity,
         "y_pred":            y_pred,
     }
+
+
+# ---------------------------------------------------------------------------
+# AURS: Area Under the Robustness Surface
+# ---------------------------------------------------------------------------
+
+def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
+    """Summarise a model's noise-robustness 2-D sweep into a single score:
+    AURS, the **Area Under the Robustness Surface**.
+
+    WHAT AURS IS
+    ------------
+    The 2-D noise sweep (`gaussian_2d_heatmap_grid_test.png` / `heatmap_agg`
+    in the notebook) evaluates every model at each combination of
+    (Gaussian noise level, covariate mean-shift), giving one AUC/PR-AUC
+    number per grid cell. AURS collapses that whole grid into ONE number per
+    model: the average fraction of the model's OWN clean-test score that it
+    retains, averaged over every stress condition in the swept grid.
+
+    It deliberately does *not* just average the raw AUC values across the
+    grid. Two models can have different clean-test AUCs, so a plain average
+    of raw degraded AUCs would conflate two different questions: "how good
+    is this model to begin with?" (already reported elsewhere -- e.g. the
+    Pareto front, or the clean-cell entry of this same grid) and "how much
+    does stress hurt it, relative to where it started?" AURS isolates the
+    second question, which is the one MORSE's own hypothesis is about: "a
+    modest cost in clean-test AUC in exchange for better robustness to
+    noise" needs the clean-cost and the robustness measured separately, and
+    AURS is the robustness half of that comparison.
+
+    HOW IT IS CALCULATED
+    ---------------------
+    1. Pivot `heatmap_agg[f"auc_{model_key}"]` -- already averaged across
+       seeds by the caller -- into a 2-D grid indexed by (mean_shift rows x
+       noise_level columns).
+    2. Locate the CLEAN cell of that grid, i.e. noise_level == 0 AND
+       mean_shift == 0 (the unperturbed test set), and read the model's
+       clean-test score there: `clean_value`.
+    3. Convert every cell into a RETENTION ratio relative to that clean
+       baseline: `retention[i, j] = auc[i, j] / clean_value`. A retention of
+       1.0 means "no degradation at all at this stress level"; 0.5 means
+       "half of the clean-test score is lost here".
+    4. Numerically integrate the retention surface over the full 2-D grid
+       with the composite trapezoidal rule (`numpy.trapz`): first along the
+       noise axis for every fixed shift level, then integrate that
+       resulting 1-D profile along the shift axis. This is a genuine double
+       integral of the (noise, shift) -> retention surface, not a naive
+       flat average, so it would still weight the grid correctly even if
+       the swept noise/shift levels were not evenly spaced.
+    5. Divide the raw integral by the grid's total area,
+       `(noise_range) x (shift_range)`, to renormalise it back onto the same
+       [~0, ~1] retention scale that a single cell lives on -- an integral
+       by itself scales with the size of the grid, not just its shape. The
+       result of this division IS the AURS score.
+
+    INTERPRETING THE SCORE
+    -----------------------
+    - AURS = 1.0 (100%): the model's score is completely flat across the
+      ENTIRE swept range of noise and covariate shift -- effectively
+      perfect robustness within the tested grid.
+    - AURS = 0.0 (0%): the model's score collapses to zero everywhere in
+      the grid except the clean cell itself.
+    - AURS can occasionally land slightly ABOVE 1.0. This is not a bug: a
+      small amount of injected noise can sometimes marginally *improve* a
+      held-out score (a mild regularisation-like effect), and heatmap_agg
+      is itself an across-seed mean, which carries its own sampling noise
+      -- both effects are most visible in the lightly-perturbed cells
+      right next to the clean cell.
+    - AURS is only meaningful together with the specific grid it was
+      computed over. Widening the swept noise/shift range will generally
+      LOWER every model's AURS even if nothing about the model itself
+      changed, simply because more (harsher) grid is now being averaged
+      in. Always report the swept `noise_levels` / `shift_levels` extent
+      alongside the score.
+
+    This normalise-by-own-clean-baseline approach is conceptually similar
+    to the relative-degradation metrics used in the image-corruption
+    robustness literature (e.g. Hendrycks & Dietterich's benchmarks of
+    common image corruptions), which likewise score robustness against a
+    model's own clean performance rather than comparing raw corrupted
+    scores across models directly.
+
+    Parameters
+    ----------
+    heatmap_agg
+        A DataFrame with a two-level MultiIndex `(noise_level, mean_shift)`
+        and at least the column `f"auc_{model_key}"`, already averaged
+        across seeds -- exactly the `heatmap_agg` built in the notebook via
+        `heatmap_df.groupby(["noise_level", "mean_shift"]).mean()`.
+    model_key
+        The model key whose column (`auc_{model_key}`) to score, e.g.
+        `"multi"`, `"single"`, `"all"`, `"forward"`.
+
+    Returns
+    -------
+    float
+        The AURS score as a fraction (multiply by 100 for a percentage).
+
+    Raises
+    ------
+    ValueError
+        If the grid has no exact (noise_level=0, mean_shift=0) clean cell to
+        normalise against, or if that cell's score is not strictly positive.
+    """
+    col: str = f"auc_{model_key}"
+    pivot: pandas.DataFrame = (
+        heatmap_agg[[col]]
+        .reset_index()
+        .pivot(index="mean_shift", columns="noise_level", values=col)
+        .sort_index(axis=0)   # ascending mean_shift
+        .sort_index(axis=1)   # ascending noise_level
+    )
+
+    shift_levels: numpy.ndarray = pivot.index.to_numpy(dtype=float)
+    noise_levels: numpy.ndarray = pivot.columns.to_numpy(dtype=float)
+    grid: numpy.ndarray = pivot.to_numpy(dtype=float)  # shape (n_shift, n_noise)
+
+    i0: int = int(numpy.argmin(numpy.abs(shift_levels)))
+    j0: int = int(numpy.argmin(numpy.abs(noise_levels)))
+    if not (numpy.isclose(shift_levels[i0], 0.0) and numpy.isclose(noise_levels[j0], 0.0)):
+        raise ValueError(
+            f"compute_aurs requires an exact (noise_level=0, mean_shift=0) "
+            f"clean cell to normalise against; closest grid point was "
+            f"(noise_level={noise_levels[j0]}, mean_shift={shift_levels[i0]})."
+        )
+
+    clean_value: float = float(grid[i0, j0])
+    if clean_value <= 0.0:
+        raise ValueError(
+            f"Clean-cell '{col}' value must be strictly positive to "
+            f"normalise by; got {clean_value}."
+        )
+
+    retention: numpy.ndarray = grid / clean_value
+
+    # Double trapezoidal integration: integrate along the noise axis for
+    # every shift level, then integrate the resulting 1-D profile along the
+    # shift axis.
+    inner: numpy.ndarray = numpy.trapz(retention, x=noise_levels, axis=1)
+    total: float = float(numpy.trapz(inner, x=shift_levels))
+
+    grid_area: float = float(noise_levels[-1] - noise_levels[0]) * float(shift_levels[-1] - shift_levels[0])
+    return total / grid_area
