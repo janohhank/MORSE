@@ -240,7 +240,11 @@ corresponding code cells:
     Gaussian noise level (0.3),
   - a 1-D **random-corruption** sweep on binary dummy features,
   - a 2-D **noise × covariate-shift** heatmap grid (one panel per method,
-    shared colour scale), plus the per-seed CSVs behind every curve.
+    shared colour scale), each panel subtitled with that method's **AURS**
+    (Area Under the Robustness Surface) score — the average fraction of its
+    own clean-test score it retains across the whole grid; see
+    `evaluation_utils.compute_aurs` for the full definition and
+    `evaluation/all_models_comparison/aurs_scores.csv` for the raw numbers.
   The Gaussian-noise and covariate-shift line plots are both 1-D slices of
   the same 2-D sweep, so no evaluations are duplicated between them and the
   heatmap grid.

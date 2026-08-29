@@ -240,7 +240,8 @@ def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
                          xlabel: str,
                          ylabel: str,
                          title: str,
-                         out_path: str) -> None:
+                         out_path: str,
+                         aurs_scores: dict[str, float] | None = None) -> None:
     """Render a 2x2 grid of heatmaps -- one panel per model -- sharing the
     same vmin/vmax so the panels are directly visually comparable.
 
@@ -254,6 +255,12 @@ def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
         Same shape as in `plot_noise_comparison`; only the display name
         (index 0) is used for the panel title -- colour/marker/linestyle
         are irrelevant for the heatmap and get ignored.
+    aurs_scores
+        Optional dict mapping each `model_styles` key to its AURS score
+        (see `evaluation_utils.compute_aurs`) -- the fraction of that
+        model's own clean-test score retained on average across this whole
+        grid. When given, each panel's title gets a second line showing it
+        as a percentage. `None` (the default) omits the subtitle.
     """
     _apply_plot_theme()
 
@@ -283,7 +290,10 @@ def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
             annot=False,
             square=False,
         )
-        ax.set_title(display_name, fontweight="bold", pad=8)
+        panel_title: str = display_name
+        if aurs_scores is not None:
+            panel_title += f"\nAURS = {aurs_scores[key]:.1%}"
+        ax.set_title(panel_title, fontweight="bold", pad=8)
         ax.set_xlabel(xlabel, fontweight="bold")
         ax.set_ylabel(ylabel, fontweight="bold")
 
