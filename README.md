@@ -235,10 +235,15 @@ corresponding code cells:
 - **All-models noise-robustness comparison** on the test set for the four
   methods (MORSE, SO-GA, all-features, forward stepwise), reported as
   mean ± 1 std across seeds:
-  - a 1-D **Gaussian noise** sweep on continuous features,
+  - a 1-D **Gaussian noise** sweep on continuous features (zero mean-shift),
+  - a 1-D **covariate-shift** sweep on continuous features at a fixed
+    Gaussian noise level (0.3),
   - a 1-D **random-corruption** sweep on binary dummy features,
   - a 2-D **noise × covariate-shift** heatmap grid (one panel per method,
     shared colour scale), plus the per-seed CSVs behind every curve.
+  The Gaussian-noise and covariate-shift line plots are both 1-D slices of
+  the same 2-D sweep, so no evaluations are duplicated between them and the
+  heatmap grid.
 - **Feature-count comparison** — a boxplot + stripplot of the number of
   selected features per method across seeds, with per-seed and summary CSVs,
   showing the parsimony of each method.
