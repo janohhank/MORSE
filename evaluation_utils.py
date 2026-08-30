@@ -10,6 +10,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
+# numpy 2.0 renamed `trapz` to `trapezoid` and later fully removed `trapz`
+# (accessing it raises AttributeError instead of merely warning); numpy < 2.0
+# only has `trapz`. Resolve once here so `compute_aurs` works unmodified on
+# either numpy major version, regardless of exactly what's installed.
+_trapezoid = getattr(numpy, "trapezoid", None) or numpy.trapz
+
 # ---------------------------------------------------------------------------
 # Sign consistency score calculation
 # ---------------------------------------------------------------------------
@@ -300,12 +306,13 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
        1.0 means "no degradation at all at this stress level"; 0.5 means
        "half of the clean-test score is lost here".
     4. Numerically integrate the retention surface over the full 2-D grid
-       with the composite trapezoidal rule (`numpy.trapz`): first along the
-       noise axis for every fixed shift level, then integrate that
-       resulting 1-D profile along the shift axis. This is a genuine double
-       integral of the (noise, shift) -> retention surface, not a naive
-       flat average, so it would still weight the grid correctly even if
-       the swept noise/shift levels were not evenly spaced.
+       with the composite trapezoidal rule (`numpy.trapezoid`, or
+       `numpy.trapz` on numpy < 2.0): first along the noise axis for every
+       fixed shift level, then integrate that resulting 1-D profile along
+       the shift axis. This is a genuine double integral of the (noise,
+       shift) -> retention surface, not a naive flat average, so it would
+       still weight the grid correctly even if the swept noise/shift levels
+       were not evenly spaced.
     5. Divide the raw integral by the grid's total area,
        `(noise_range) x (shift_range)`, to renormalise it back onto the same
        [~0, ~1] retention scale that a single cell lives on -- an integral
@@ -394,9 +401,10 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
 
     # Double trapezoidal integration: integrate along the noise axis for
     # every shift level, then integrate the resulting 1-D profile along the
-    # shift axis.
-    inner: numpy.ndarray = numpy.trapz(retention, x=noise_levels, axis=1)
-    total: float = float(numpy.trapz(inner, x=shift_levels))
+    # shift axis. `_trapezoid` resolves to numpy.trapezoid (numpy >= 2.0) or
+    # numpy.trapz (numpy < 2.0) -- see the module-level comment above.
+    inner: numpy.ndarray = _trapezoid(retention, x=noise_levels, axis=1)
+    total: float = float(_trapezoid(inner, x=shift_levels))
 
     grid_area: float = float(noise_levels[-1] - noise_levels[0]) * float(shift_levels[-1] - shift_levels[0])
     return total / grid_area
