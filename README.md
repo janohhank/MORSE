@@ -68,8 +68,10 @@ The repository compares MORSE against three baselines: a single-objective GA
 (AUC only), forward stepwise selection via scikit-learn, and the no-selection
 all-features logistic regression. Every method is evaluated across **20
 random seeds** on both clean and progressively noised versions of a **single
-fixed test set** (Gaussian noise + covariate shift on continuous features;
-random binary corruption on dummy features), and results are reported as
+fixed test set** (Gaussian noise on continuous features; a covariate shift of
+the test population, implemented by re-weighting the test patients along the
+dominant covariate axis; random binary corruption on dummy features), and
+results are reported as
 **mean ± 1 standard deviation across seeds**. See
 [Numerical reproducibility](#numerical-reproducibility) for exactly what the
 seed varies — this is a deliberate design choice.
@@ -123,8 +125,8 @@ data through its official access pathway and add a matching config block.
 | `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector`. |
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
 | `training_utils` | `save_stats_csv`, `ensure_directory`, and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
-| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×shift heatmap grid, the sensitivity/specificity curve, and the feature-count boxplot. |
-| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian + mean-shift), `apply_dummy_noise` (random binary corruption), `build_model_package` (final refit on full train), `evaluate_model`, and `find_balanced_threshold`. |
+| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×covariate-shift heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
+| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (random binary corruption), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
 
 ---
 
@@ -176,6 +178,7 @@ YYYY-MM-DD_HH-MM-SS/
 └── evaluation/
     ├── all_models_comparison/            # 4-model noise-robustness curves + 2-D heatmap grid + per-seed CSVs
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
+    ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
     └── best_morse_model/                 # best-seed metrics CSV + sensitivity/specificity curve PDF
 ```
 
@@ -235,9 +238,9 @@ corresponding code cells:
 - **All-models noise-robustness comparison** on the test set for the four
   methods (MORSE, SO-GA, all-features, forward stepwise), reported as
   mean ± 1 std across seeds:
-  - a 1-D **Gaussian noise** sweep on continuous features (zero mean-shift),
-  - a 1-D **covariate-shift** sweep on continuous features at a fixed
-    Gaussian noise level (0.3),
+  - a 1-D **Gaussian noise** sweep on continuous features (no covariate
+    shift),
+  - a 1-D **covariate-shift** sweep at a fixed Gaussian noise level (0.3),
   - a 1-D **random-corruption** sweep on binary dummy features,
   - a 2-D **noise × covariate-shift** heatmap grid (one panel per method,
     shared colour scale), each panel subtitled with that method's **AURS**
@@ -248,9 +251,38 @@ corresponding code cells:
   The Gaussian-noise and covariate-shift line plots are both 1-D slices of
   the same 2-D sweep, so no evaluations are duplicated between them and the
   heatmap grid.
+
+  **How the covariate shift is defined.** A covariate shift changes *which
+  patients are represented* (P(x)) while every patient keeps their own
+  (x, y) pair. Translating the feature values by a constant — the earlier
+  implementation — cannot do that for a logistic-regression score: every
+  logit moves by the same constant, the ranking of the patients is unchanged,
+  and ROC-AUC / PR-AUC are *exactly* invariant (verified on real runs:
+  bit-identical scores across all shift levels at zero noise). The shift is
+  therefore applied by **re-weighting the test patients**: the axis is the
+  first principal component (PC1) of the standardised training covariates
+  (the dominant direction of variation of the patient population), patient
+  *i* gets the weight `exp(strength · z_i)` with `z_i` its PC1 score in
+  training-SD units (clipped at ±2), normalised within each class so the
+  outcome prevalence is preserved exactly, and the metric is the weighted
+  ROC-AUC / PR-AUC of the unchanged predictions. Strength 0 is the ordinary
+  test set; ±1 tilts the population by about one SD towards the high / low
+  end of PC1. The effective sample size of the re-weighted test set is
+  printed for the extreme strengths (strong shifts are noisier by
+  construction, for every model alike). See
+  `evaluation_utils.covariate_shift_weights` for the full definition.
 - **Feature-count comparison** — a boxplot + stripplot of the number of
   selected features per method across seeds, with per-seed and summary CSVs,
   showing the parsimony of each method.
+- **Sign consistency of the final models** — for each of the four methods and
+  each seed, the fraction of the final (full-training-set refit) model's
+  features whose logistic-regression coefficient has the same sign as the
+  feature's marginal correlation with the target, using the same strict rule
+  as the GA fitness (`evaluation_utils.compute_model_sign_consistency`).
+  This measures MORSE's target quantity on the baselines too, which never see
+  it during selection. Read it together with the feature counts: a model with
+  a single feature is trivially 100% consistent. Boxplot + per-seed and
+  summary CSVs.
 - **Best-MORSE-model deployment report** — the seed whose MORSE model achieves
   the highest test AUC is selected; at the balanced sensitivity ≈ specificity
   threshold it reports accuracy, ROC-AUC, PR-AUC, F1, sensitivity, and

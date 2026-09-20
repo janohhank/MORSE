@@ -418,3 +418,72 @@ def plot_feature_count_comparison(feature_count_df: pandas.DataFrame,
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Sign consistency of the final models
+# ---------------------------------------------------------------------------
+
+def plot_sign_consistency_comparison(sign_df: pandas.DataFrame,
+                                     method_order: Sequence[str],
+                                     palette: dict[str, str],
+                                     n_seeds: int,
+                                     out_path: str) -> None:
+    """Boxplot + stripplot overlay comparing the sign consistency of the final
+    (full-training-set refit) model across methods, one dot per seed; each box
+    is annotated with its median.
+
+    Parameters
+    ----------
+    sign_df
+        Long-format frame with columns {"method", "seed", "sign_consistency"}
+        (see `evaluation_utils.compute_model_sign_consistency`).
+    method_order
+        Explicit x-axis order for the methods.
+    palette
+        Dict mapping method name -> matplotlib colour string.
+    n_seeds
+        Number of seeds contributing to the distribution (goes into the title).
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.boxplot(
+        data=sign_df,
+        x="method", y="sign_consistency",
+        order=list(method_order), hue="method", palette=palette,
+        legend=False, width=0.5, ax=ax,
+    )
+    sns.stripplot(
+        data=sign_df,
+        x="method", y="sign_consistency",
+        order=list(method_order),
+        color="black", size=4, alpha=0.6, jitter=0.15, ax=ax,
+    )
+
+    for i, method in enumerate(method_order):
+        med: float = sign_df.loc[
+            sign_df["method"] == method, "sign_consistency"
+        ].median()
+        ax.annotate(
+            f"median={med:.3f}",
+            xy=(i, med), xytext=(0, 14),
+            textcoords="offset points", ha="center",
+            fontsize=9, color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.8),
+        )
+
+    ax.set_xlabel("Method", fontweight="bold")
+    ax.set_ylabel("Sign consistency of the final model\n(fraction of selected features)",
+                  fontweight="bold")
+    ax.set_title(
+        f"Sign Consistency of the Final Refit Model per Method Across {n_seeds} Seeds\n"
+        f"(box = IQR with median line, dots = individual seeds)",
+        fontweight="bold", pad=10,
+    )
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)

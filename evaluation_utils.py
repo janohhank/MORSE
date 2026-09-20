@@ -33,7 +33,8 @@ def compute_marginal_correlations(
     Returns a numpy array of length `X.shape[1]`, aligned with the column
     order of `X`.
     """
-    X_arr: numpy.ndarray = X.to_numpy() if hasattr(X, "to_numpy") else numpy.asarray(X)
+    X_arr: numpy.ndarray = (X.to_numpy(dtype=float) if hasattr(X, "to_numpy")
+                            else numpy.asarray(X, dtype=float))
     y_int: numpy.ndarray = numpy.asarray(y, dtype=int)
     n_features: int = X_arr.shape[1]
 
@@ -49,6 +50,61 @@ def compute_marginal_correlations(
             corr, _ = pointbiserialr(y_int, feat)
             out[j] = float(corr)
     return out
+
+
+def compute_model_sign_consistency(
+        model_pkg: dict[str, Any],
+        marginal_corr: pandas.Series) -> dict[str, Any]:
+    """Sign consistency of a FINAL (full-training-set refit) model.
+
+    The fraction of the model's selected features whose fitted logistic
+    regression coefficient has the same sign as that feature's marginal
+    correlation with the target (Matthews / point-biserial, see
+    `compute_marginal_correlations`). It is the very quantity MORSE optimises,
+    with the same strict rule as the GA fitness in
+    `MultiObjectiveTraining._evaluate_multi`: a feature counts as INCONSISTENT
+    if `marginal_corr * coefficient` is negative or numerically zero, and as
+    consistent otherwise. Two differences from the fitness value, both on
+    purpose: it is measured on the deployed model, i.e. the coefficients of the
+    refit on the WHOLE training set and the marginal correlations of the whole
+    training set (the GA fitness averages three fold-wise estimates), and it can
+    be computed for every method -- including the baselines, which never see the
+    quantity during selection.
+
+    Read it together with the number of selected features: a model with a single
+    feature is trivially 100% consistent (with one predictor the coefficient
+    always has the sign of the marginal correlation), so the measure is only
+    informative between models of comparable size.
+
+    Parameters
+    ----------
+    model_pkg
+        A package from `build_model_package` ("model", "scaler", "features").
+    marginal_corr
+        Marginal correlation of EVERY candidate feature with the target on the
+        training set, indexed by feature name -- compute it once with
+        `pandas.Series(compute_marginal_correlations(X_train, y_train),
+        index=X_train.columns)` and reuse it for all models.
+
+    Returns
+    -------
+    dict with `n_features`, `n_consistent`, `n_inconsistent` and
+    `sign_consistency` (= n_consistent / n_features).
+    """
+    corr: numpy.ndarray = marginal_corr.loc[model_pkg["features"]].to_numpy(dtype=float)
+    coef: numpy.ndarray = model_pkg["model"].coef_[0]
+
+    check: numpy.ndarray = corr * coef
+    inconsistent: numpy.ndarray = (check < 0) | numpy.isclose(check, 0.0, atol=1e-12)
+
+    n_features: int = int(len(check))
+    n_inconsistent: int = int(inconsistent.sum())
+    return {
+        "n_features":       n_features,
+        "n_consistent":     n_features - n_inconsistent,
+        "n_inconsistent":   n_inconsistent,
+        "sign_consistency": 1.0 - n_inconsistent / n_features,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -79,19 +135,24 @@ def apply_proportional_noise(
         X_test: pandas.DataFrame,
         train_std: pandas.Series,
         noise_fraction: float,
-        mean_shift_fraction: float,
         continuous_cols: list[str]) -> pandas.DataFrame:
     """
-    Adds Gaussian noise and/or systematic mean shift to continuous variables,
-    proportional to the training-set standard deviation.
+    Adds zero-mean Gaussian measurement noise to the continuous variables,
+    proportional to each column's training-set standard deviation.
 
-    noise_fraction:      0.0-1.0  (scale of additive Gaussian noise)
-    mean_shift_fraction: -1.0-1.0 (direction and magnitude of covariate shift)
+    noise_fraction: 0.0-1.0 (noise standard deviation as a fraction of the
+                    training standard deviation of that column)
+
+    This function deliberately models NOISE only. An earlier version also
+    translated every continuous column by a constant ("mean shift"); that was
+    removed because, for a logistic-regression score and a rank-based metric
+    (ROC-AUC / PR-AUC), adding the same constant to a feature for every test
+    row shifts every logit by one and the same amount, which cannot change the
+    ranking of the patients -- the shift axis was verified to have exactly zero
+    effect on the scores. Covariate shift is modelled by re-weighting the test
+    population instead: see `covariate_shift_weights`.
     """
-    no_noise: bool = numpy.isclose(noise_fraction, 0.0, atol=1e-09)
-    no_shift: bool = numpy.isclose(mean_shift_fraction, 0.0, atol=1e-09)
-
-    if no_noise and no_shift:
+    if numpy.isclose(noise_fraction, 0.0, atol=1e-09):
         return X_test.copy()
 
     X_out: pandas.DataFrame = X_test.copy()
@@ -101,13 +162,9 @@ def apply_proportional_noise(
             continue
         std_val: float = train_std[col]
 
-        if not no_shift:
-            X_out[col] += mean_shift_fraction * std_val
-
-        if not no_noise:
-            noise: numpy.ndarray = numpy.random.normal(
-                loc=0.0, scale=noise_fraction * std_val, size=len(X_out))
-            X_out[col] += noise
+        noise: numpy.ndarray = numpy.random.normal(
+            loc=0.0, scale=noise_fraction * std_val, size=len(X_out))
+        X_out[col] += noise
 
     return X_out
 
@@ -156,6 +213,118 @@ def apply_dummy_noise(
 
 
 # ---------------------------------------------------------------------------
+# Covariate shift (re-weighted test population)
+# ---------------------------------------------------------------------------
+
+def fit_covariate_shift_axis(X_train: pandas.DataFrame) -> dict[str, Any]:
+    """Fit the axis along which the test population is shifted: the first
+    principal component (PC1) of the standardised TRAINING covariates (all
+    features, continuous and binary alike).
+
+    PC1 is the dominant direction of variation of the patient population (on
+    RadFusion, for example, an overall medication / hospitalisation burden), so
+    shifting the population along it is a model-agnostic, dataset-agnostic
+    notion of "a different case mix". The axis is fitted on the training data
+    only, and the very same axis is used for every model, seed and noise level.
+
+    Returns a dict with the feature order, the training mean / std used for the
+    standardisation (zero-variance columns get std=1 and therefore contribute
+    nothing), the unit-length PC1 `loading`, and `score_std`, the training
+    standard deviation of the projection, so that the PC1 score of any patient
+    can be expressed in training-SD units. The sign of a principal axis is
+    arbitrary; it is fixed here so that the loadings sum to a positive value,
+    which makes "positive shift strength" reproducible across runs and machines.
+    """
+    features: list[str] = list(X_train.columns)
+    X: numpy.ndarray = X_train.to_numpy(dtype=float)
+
+    mean: numpy.ndarray = X.mean(axis=0)
+    std: numpy.ndarray = X.std(axis=0)
+    std[std == 0.0] = 1.0
+    Z: numpy.ndarray = (X - mean) / std
+
+    covariance: numpy.ndarray = (Z.T @ Z) / Z.shape[0]
+    _, eigenvectors = numpy.linalg.eigh(covariance)   # eigenvalues ascending
+    loading: numpy.ndarray = eigenvectors[:, -1]
+    if loading.sum() < 0.0:
+        loading = -loading
+
+    return {
+        "features":  features,
+        "mean":      mean,
+        "std":       std,
+        "loading":   loading,
+        "score_std": float((Z @ loading).std()),
+    }
+
+
+def covariate_shift_weights(
+        shift_axis: dict[str, Any],
+        X_test: pandas.DataFrame,
+        y_test: Union[numpy.ndarray, pandas.Series],
+        strength: float,
+        max_abs_score: float = 2.0) -> numpy.ndarray:
+    """Importance weights that shift the TEST population along the PC1 axis by
+    `strength` standard deviations (a covariate shift). Pass them as
+    `sample_weight` to the metric (see `score_predictions`).
+
+    WHY THE FEATURE VALUES ARE NOT SHIFTED
+    A constant translation of features (x -> x + c for every test row) cannot
+    change the ranking produced by a logistic-regression score -- every logit
+    moves by the same constant -- so ROC-AUC / PR-AUC are exactly invariant to
+    it (verified on real runs: bit-identical scores at zero noise). Editing the
+    feature values of a real patient would also silently change what that
+    patient's (unchanged) label means. A genuine covariate shift changes which
+    patients are represented, i.e. P(x), while every patient keeps their own
+    (x, y) pair, i.e. P(y | x) stays intact. Re-weighting does exactly that.
+
+    DEFINITION
+        z_i = PC1 score of test patient i in training-SD units, clipped to
+              [-max_abs_score, +max_abs_score]
+        w_i is proportional to exp(strength * z_i)
+    The weights are then normalised WITHIN each class so that the total weight
+    of the positives and of the negatives equals their original counts.
+    Consequences:
+      * the outcome prevalence is preserved exactly, so PR-AUC is not
+        contaminated by a change of the label prior;
+      * both classes are tilted by the same factor, so P(y | x) changes at most
+        by a constant log-odds offset, which cannot alter any ranking metric;
+      * strength = 0 gives w_i = 1 and reproduces the unweighted metric.
+    For a Gaussian score, exponential tilting by `strength` moves the mean of
+    the weighted PC1 score by `strength` standard deviations and leaves its
+    variance unchanged, so `strength` keeps the meaning of the former "mean
+    shift in standard deviations": positive = towards the high end of PC1,
+    negative = towards the low end.
+
+    WHY THE CLIP
+    Heavy-tailed axes (e.g. medication burden) let a handful of outlying
+    patients dominate an untruncated tilt. Measured on the RadFusion test set
+    at strength +1, the effective sample size was 26% of n with a +-3 SD clip
+    and 39% with the default +-2 SD clip (max weight 9.4 vs 4.5). Truncating
+    the score is the standard weight-truncation remedy.
+
+    The effective sample size ESS = (sum w)^2 / sum(w^2) tells how many
+    unweighted patients the re-weighted test set is worth; the metric under a
+    strong shift is correspondingly noisier (a property of the finite test
+    set, shared by all models).
+    """
+    Z: numpy.ndarray = (
+        X_test[shift_axis["features"]].to_numpy(dtype=float) - shift_axis["mean"]
+    ) / shift_axis["std"]
+    score: numpy.ndarray = (Z @ shift_axis["loading"]) / shift_axis["score_std"]
+    score = numpy.clip(score, -max_abs_score, max_abs_score)
+
+    weights: numpy.ndarray = numpy.exp(strength * score)
+
+    y: numpy.ndarray = numpy.asarray(y_test).astype(int)
+    for cls in (0, 1):
+        in_class: numpy.ndarray = y == cls
+        if in_class.any():
+            weights[in_class] *= in_class.sum() / weights[in_class].sum()
+    return weights
+
+
+# ---------------------------------------------------------------------------
 # Model building and evaluation
 # ---------------------------------------------------------------------------
 
@@ -181,20 +350,39 @@ def build_model_package(
     return {"model": model, "scaler": scaler, "features": selected_features}
 
 
+def predict_scores(
+        model_pkg: dict[str, Any],
+        X: pandas.DataFrame) -> numpy.ndarray:
+    """Predicted positive-class probabilities of a model package on (possibly
+    noisy) data. Split from the metric so that one prediction can be scored
+    under many test-population weightings (see `covariate_shift_weights`)."""
+    features: list[str] = model_pkg["features"]
+    X_scaled: numpy.ndarray = model_pkg["scaler"].transform(X[features].to_numpy())
+    return model_pkg["model"].predict_proba(X_scaled)[:, 1]
+
+
+def score_predictions(
+        y_true: Union[numpy.ndarray, pandas.Series],
+        y_prob: numpy.ndarray,
+        use_roc_auc: bool = True,
+        sample_weight: Union[numpy.ndarray, None] = None) -> float:
+    """ROC-AUC (or PR-AUC / average precision) of a prediction vector,
+    optionally under per-patient `sample_weight`s (a re-weighted test
+    population). `sample_weight=None` is the ordinary unweighted metric."""
+    if use_roc_auc:
+        return float(roc_auc_score(y_true, y_prob, sample_weight=sample_weight))
+    return float(average_precision_score(y_true, y_prob, sample_weight=sample_weight))
+
+
 def evaluate_model(
         model_pkg: dict[str, Any],
         X_test: pandas.DataFrame,
         y_test: pandas.Series,
-        use_roc_auc: bool = True) -> float:
+        use_roc_auc: bool = True,
+        sample_weight: Union[numpy.ndarray, None] = None) -> float:
     """Score a model package on (possibly noisy) test data."""
-    features: list[str] = model_pkg["features"]
-    X_scaled: numpy.ndarray = model_pkg["scaler"].transform(
-        X_test[features].to_numpy())
-    y_prob: numpy.ndarray = model_pkg["model"].predict_proba(X_scaled)[:, 1]
-
-    if use_roc_auc:
-        return float(roc_auc_score(y_test, y_prob))
-    return float(average_precision_score(y_test, y_prob))
+    return score_predictions(
+        y_test, predict_scores(model_pkg, X_test), use_roc_auc, sample_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +465,14 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
     ------------
     The 2-D noise sweep (`gaussian_2d_heatmap_grid_test.png` / `heatmap_agg`
     in the notebook) evaluates every model at each combination of
-    (Gaussian noise level, covariate mean-shift), giving one AUC/PR-AUC
-    number per grid cell. AURS collapses that whole grid into ONE number per
-    model: the average fraction of the model's OWN clean-test score that it
-    retains, averaged over every stress condition in the swept grid.
+    (Gaussian noise level, covariate-shift strength), giving one AUC/PR-AUC
+    number per grid cell. The second axis is stored in the column named
+    `mean_shift`; it holds the strength of the re-weighted-population covariate
+    shift of `covariate_shift_weights` (in SD of the dominant covariate axis),
+    not a translation of feature values. AURS collapses that whole grid into
+    ONE number per model: the average fraction of the model's OWN clean-test
+    score that it retains, averaged over every stress condition in the swept
+    grid.
 
     It deliberately does *not* just average the raw AUC values across the
     grid. Two models can have different clean-test AUCs, so a plain average
