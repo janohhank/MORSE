@@ -110,8 +110,9 @@ class MultiObjectiveTraining:
             X_fold_train_sub: numpy.ndarray = X_fold_train_scaled[:, cols]
             X_fold_val_sub: numpy.ndarray = X_fold_val_scaled[:, cols]
 
+            # L2 is scikit-learn's default penalty; an explicit `penalty="l2"`
+            # is deprecated since scikit-learn 1.8 (removed in 1.10).
             model: LogisticRegression = LogisticRegression(
-                penalty="l2",
                 solver="lbfgs",
                 max_iter=1000,
                 random_state=self._config.seed)

@@ -172,42 +172,92 @@ def apply_proportional_noise(
 def apply_dummy_noise(
         X_test: pandas.DataFrame,
         noise_fraction: float,
-        dummy_cols: list[str]) -> pandas.DataFrame:
+        dummy_cols: list[str],
+        train_prevalence: pandas.Series) -> pandas.DataFrame:
     """
-    Randomisation noise on dummy (binary) variables.
+    Prevalence-preserving randomisation noise on dummy (binary) variables.
 
-    noise_fraction: fraction [0.0-1.0] of cells that are **replaced** with a
-    random coin flip (0 or 1 with equal probability).
+    Every dummy cell is, independently, **re-drawn with probability
+    `noise_fraction`** from a Bernoulli distribution with the column's own
+    TRAINING prevalence `pi_j = train_prevalence[j]`; the remaining cells keep
+    their value. The re-draw does not look at the cell's value or at the label.
 
-    * 0.0  → original data, no noise
-    * 0.5  → half the dummy cells are replaced with random values
-    * 1.0  → all dummy cells are uniformly random (maximum entropy, no signal)
+    * 0.0  -> original data, no noise
+    * 0.5  -> half of the cells are re-drawn from their column's marginal
+    * 1.0  -> every column is independent of the truth but keeps its prevalence
+              (no information left, monotonic all the way -- fractions above
+              0.5 cannot invert the signal)
 
-    This guarantees monotonic signal degradation: unlike deterministic bit-flip,
-    fractions above 0.5 cannot invert and recover the original signal.
+    WHY NOT A FAIR COIN (the earlier implementation re-drew with P(1) = 0.5)
+    A fair coin is far from the marginal of a rare flag, so it does not add
+    "a little noise", it floods the column with false positives. With a 4%
+    prevalence flag and 10% of the cells re-drawn, about 4.8% of all patients
+    turn into false positives while only 3.8% are true positives that survived:
+    a recorded "1" is right only 44% of the time (94% for a 45%-prevalence flag
+    at the same setting), and the column's prevalence more than doubles.
+    Measured on the 273 binary RadFusion columns (57% of them below 5%
+    prevalence) at 10% re-drawn cells, the noise variance was 2.8 times the
+    column's own signal variance for the rare columns (correlation with the
+    clean column 0.51) but only 0.4 times for the dense ones (correlation 0.84).
+    The corruption therefore hurt a model according to how SPARSE its features
+    happen to be, not according to how much it relies on them, and it changed
+    every column's prevalence -- a prevalence shift on top of the noise.
+
+    PROPERTIES OF THE RE-DRAW (p = noise_fraction, pi = the column prevalence)
+      * prevalence is preserved: E[X'] = pi whenever the test prevalence equals
+        the training prevalence (a small, documented difference otherwise);
+      * every column keeps the SAME correlation 1 - p with its clean version
+        and gets the same noise-to-signal variance ratio 2p, whatever its
+        prevalence (verified on the RadFusion columns: 0.90 and 0.20 at p = 0.1
+        for the rare, medium and dense columns alike). It is the binary
+        counterpart of `apply_proportional_noise`, which scales its Gaussian
+        noise by every column's standard deviation;
+      * a recorded 1 is right with probability 1 - p*(1 - pi), i.e. about
+        1 - p for rare flags, and false positives affect only about p*pi of
+        the patients (0.4% instead of 4.8% in the example above);
+      * degradation is monotone in p and needs no cap for very dense columns
+        (a scheme that keeps sensitivity = precision = 1 - p by flipping 0 -> 1
+        with probability p*pi/(1 - pi) would exceed probability 1 for every
+        column with pi > 1/(1 + p), e.g. the seven RadFusion lab flags with
+        91-94% prevalence at p = 0.1).
+
+    LIMITATION: every column is re-drawn independently, so the noise breaks
+    the association BETWEEN columns for the re-drawn cells (a real recording
+    error would often be correlated across related codes).
+
+    Uses the global `numpy.random` state (seed it with `set_seed`), like
+    `apply_proportional_noise`. The dtype of every column (bool / int / float)
+    is preserved.
+
+    X_test:           the (clean) test features.
+    noise_fraction:   p in [0, 1], the share of dummy cells that are re-drawn.
+    dummy_cols:       the binary columns to corrupt (see `get_dummy_columns`).
+    train_prevalence: per-column mean of the TRAINING data, e.g.
+                      `X_train[dummy_cols].mean()`. Estimated on the training
+                      data only, so the noise never looks at test data.
     """
+    if not 0.0 <= noise_fraction <= 1.0:
+        raise ValueError(f"noise_fraction must be in [0, 1], got {noise_fraction}")
+
     if numpy.isclose(noise_fraction, 0.0, atol=1e-09):
         return X_test.copy()
 
     X_out: pandas.DataFrame = X_test.copy()
+    cols: list[str] = [
+        col for col in dummy_cols if col in X_out.columns and col in train_prevalence.index]
+    if not cols:
+        return X_out
 
-    for col in dummy_cols:
-        if col not in X_out.columns:
-            continue
-        # Select which cells to corrupt
-        corrupt_mask: numpy.ndarray = numpy.random.rand(len(X_out)) < noise_fraction
-        n_corrupt: int = int(corrupt_mask.sum())
+    clean: numpy.ndarray = X_out[cols].to_numpy(dtype=float)
+    prevalence: numpy.ndarray = train_prevalence[cols].to_numpy(dtype=float)
 
-        if n_corrupt == 0:
-            continue
+    redraw: numpy.ndarray = numpy.random.random_sample(clean.shape) < noise_fraction
+    redrawn: numpy.ndarray = (
+        numpy.random.random_sample(clean.shape) < prevalence).astype(float)
+    noisy: numpy.ndarray = numpy.where(redraw, redrawn, clean)
 
-        # Replace selected cells with uniform random {0, 1}
-        random_vals: numpy.ndarray = numpy.random.randint(0, 2, size=n_corrupt)
-
-        if pandas.api.types.is_bool_dtype(X_out[col]):
-            X_out.loc[corrupt_mask, col] = random_vals.astype(bool)
-        else:
-            X_out.loc[corrupt_mask, col] = random_vals
+    for position, col in enumerate(cols):
+        X_out[col] = noisy[:, position].astype(X_out[col].dtype)
 
     return X_out
 
@@ -343,8 +393,10 @@ def build_model_package(
     scaler: StandardScaler = StandardScaler()
     X_scaled: numpy.ndarray = scaler.fit_transform(X_train[selected_features].to_numpy())
 
+    # L2 is scikit-learn's default penalty. Passing `penalty="l2"` explicitly is
+    # deprecated since scikit-learn 1.8 (removed in 1.10) and warns on every fit.
     model: LogisticRegression = LogisticRegression(
-        penalty="l2", solver="lbfgs", max_iter=1000, random_state=seed)
+        solver="lbfgs", max_iter=1000, random_state=seed)
     model.fit(X_scaled, y_train)
 
     return {"model": model, "scaler": scaler, "features": selected_features}

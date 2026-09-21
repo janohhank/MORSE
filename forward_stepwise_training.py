@@ -42,9 +42,11 @@ class ForwardStepwiseTraining:
         """Fit SFS and return the selected feature mask as a bit-vector
         (list[int], values in {0, 1}) aligned with the column order of
         `X_train`."""
+        # L2 is scikit-learn's default penalty; an explicit `penalty="l2"` is
+        # deprecated since scikit-learn 1.8 (removed in 1.10).
         pipe: Pipeline = Pipeline([
             ("lr", LogisticRegression(
-                penalty="l2", solver="lbfgs",
+                solver="lbfgs",
                 max_iter=1000, random_state=self._config.seed)),
         ])
 

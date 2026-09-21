@@ -70,7 +70,7 @@ all-features logistic regression. Every method is evaluated across **20
 random seeds** on both clean and progressively noised versions of a **single
 fixed test set** (Gaussian noise on continuous features; a covariate shift of
 the test population, implemented by re-weighting the test patients along the
-dominant covariate axis; random binary corruption on dummy features), and
+dominant covariate axis; prevalence-preserving noise on binary dummy features), and
 results are reported as
 **mean ± 1 standard deviation across seeds**. See
 [Numerical reproducibility](#numerical-reproducibility) for exactly what the
@@ -126,7 +126,7 @@ data through its official access pathway and add a matching config block.
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
 | `training_utils` | `save_stats_csv`, `ensure_directory`, and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×covariate-shift heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
-| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (random binary corruption), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
+| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (prevalence-preserving noise on binary dummy features), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
 
 ---
 
@@ -134,8 +134,11 @@ data through its official access pathway and add a matching config block.
 
 ### Prerequisites
 
-- **Python 3.10+** (the code uses `X | None` unions and builtin generics).
-- Install the pinned scientific stack:
+- **Python 3.12+** for the pinned stack below (`numpy 2.5` and `scipy 1.18`
+  require it; the code itself only uses Python 3.10+ syntax such as
+  `X | None` unions and builtin generics).
+- Install the pinned scientific stack — the exact versions the reported runs
+  were produced with:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -143,7 +146,7 @@ python -m pip install -r requirements.txt
 
 This installs `numpy`, `pandas`, `scipy`, `scikit-learn`, `matplotlib`,
 `seaborn`, `deap`, and `joblib` — the only third-party packages the code
-imports.
+imports — plus `moocore`, which `deap` depends on.
 
 A reasonably fast multi-core workstation is recommended: with `N_JOBS=-1` the
 full pipeline (20 seeds × NSGA-II + SO-GA + SFS + noise sweeps) runs in
@@ -241,7 +244,8 @@ corresponding code cells:
   - a 1-D **Gaussian noise** sweep on continuous features (no covariate
     shift),
   - a 1-D **covariate-shift** sweep at a fixed Gaussian noise level (0.3),
-  - a 1-D **random-corruption** sweep on binary dummy features,
+  - a 1-D **binary-noise** sweep on the dummy features (a fraction *p* of
+    the cells is re-drawn from its column's training prevalence),
   - a 2-D **noise × covariate-shift** heatmap grid (one panel per method,
     shared colour scale), each panel subtitled with that method's **AURS**
     (Area Under the Robustness Surface) score — the average fraction of its
@@ -271,6 +275,20 @@ corresponding code cells:
   printed for the extreme strengths (strong shifts are noisier by
   construction, for every model alike). See
   `evaluation_utils.covariate_shift_weights` for the full definition.
+
+  **How the binary noise is defined.** Every dummy cell is re-drawn with
+  probability *p* from a Bernoulli distribution with the column's *training
+  prevalence* (`evaluation_utils.apply_dummy_noise`); the other cells keep
+  their value. The earlier version re-drew from a fair coin, which floods a
+  rare flag with false positives: on RadFusion (57% of the binary columns
+  are below 5% prevalence) the noise variance at *p* = 0.1 was 2.8× the
+  signal variance of the rare columns but only 0.4× for the dense ones, so
+  the curve mostly measured how sparse each model's features are. The
+  re-draw keeps every column's prevalence and gives every column the same
+  correlation 1 − *p* with its clean version (0.90 at *p* = 0.1 for rare,
+  medium and dense columns alike); *p* = 1 leaves no information. Columns
+  are re-drawn independently, so associations between related columns are
+  not preserved for the re-drawn cells.
 - **Feature-count comparison** — a boxplot + stripplot of the number of
   selected features per method across seeds, with per-seed and summary CSVs,
   showing the parsimony of each method.
