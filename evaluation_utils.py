@@ -173,7 +173,7 @@ def apply_dummy_noise(
         X_test: pandas.DataFrame,
         noise_fraction: float,
         dummy_cols: list[str],
-        train_prevalence: pandas.Series) -> pandas.DataFrame:
+        train_prevalence: pandas.Series | None = None) -> pandas.DataFrame:
     """
     Prevalence-preserving randomisation noise on dummy (binary) variables.
 
@@ -234,7 +234,10 @@ def apply_dummy_noise(
     dummy_cols:       the binary columns to corrupt (see `get_dummy_columns`).
     train_prevalence: per-column mean of the TRAINING data, e.g.
                       `X_train[dummy_cols].mean()`. Estimated on the training
-                      data only, so the noise never looks at test data.
+                      data only, so the noise never looks at test data. Optional
+                      so that the earlier three-argument call keeps working: if
+                      omitted, the prevalence of `X_test` itself is used (the
+                      noise then preserves the TEST prevalence in expectation).
     """
     if not 0.0 <= noise_fraction <= 1.0:
         raise ValueError(f"noise_fraction must be in [0, 1], got {noise_fraction}")
@@ -243,6 +246,8 @@ def apply_dummy_noise(
         return X_test.copy()
 
     X_out: pandas.DataFrame = X_test.copy()
+    if train_prevalence is None:
+        train_prevalence = X_out[[col for col in dummy_cols if col in X_out.columns]].mean()
     cols: list[str] = [
         col for col in dummy_cols if col in X_out.columns and col in train_prevalence.index]
     if not cols:
