@@ -128,7 +128,7 @@ data through its official access pathway and add a matching config block.
 | `single_objective_training.SingleObjectiveTraining` | Single-objective AUC-only GA (DEAP `eaMuPlusLambda`) used as the SO-GA baseline. |
 | `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector`. |
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
-| `training_utils` | `save_stats_csv`, `ensure_directory`, and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
+| `training_utils` | `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×covariate-shift heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
 | `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (prevalence-preserving noise on binary dummy features), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
@@ -180,7 +180,10 @@ leaks into the training data.
    - `RESUME_FROM` (default `None`; the result directory of an earlier run to
      continue without retraining, see [Checkpoints](#checkpoints-and-resuming-a-run)).
 4. **Run all cells.** Outputs are written to a timestamped directory in the
-   working folder:
+   **repository root** — whatever working directory the kernel was started in
+   (the path is printed at the start of the run). Run `training_notebook.ipynb`
+   from the repository root; a copy of the notebook archived inside a result
+   folder contains the code of its time and does not get later changes:
 
 ```
 YYYY-MM-DD_HH-MM-SS/
@@ -198,8 +201,11 @@ YYYY-MM-DD_HH-MM-SS/
 
 Training is the slow part (tens of minutes for 20 seeds); the evaluation after
 it takes minutes. Every seed is therefore written to
-`<run>/checkpoints/training/seed_<N>/` **the moment its four methods are done**
-(by the worker that trained it):
+`<run>/checkpoints/training/seed_<N>/` **the moment the seed is done** (by the
+worker that trained it). Forward stepwise selection and the all-features model
+do not depend on the seed, so they are computed once and saved as
+`shared_baselines.json` in the checkpoint folder; each seed's checkpoint
+contains a copy:
 
 - `morse_front.csv` — every Pareto individual of MORSE: AUC, sign
   consistency, feature count and the feature mask as a 0/1 string (in the
@@ -219,8 +225,10 @@ they are rebuilt from the masks in seconds.
 
 To continue after a failure (a crash in the evaluation, an interrupted
 training, a lost kernel): restart the kernel, set
-`RESUME_FROM = "<result directory>"` in cell 2 and run all cells. Training
-then loads the seeds that have a checkpoint and trains only the missing ones;
+`RESUME_FROM = "<result directory>"` (a folder name in the repository root,
+or an absolute path) in cell 2 and run all cells. Training then loads the seeds
+that have a checkpoint and trains only the missing ones (reusing the saved
+SFS / all-features result);
 the evaluation runs again into the same directory. Resuming with different
 data or settings raises `CheckpointMismatchError` (listing what differs)
 instead of mixing results, while a change of the algorithm source code only
@@ -247,7 +255,13 @@ varies is the GA's own algorithmic stochasticity. This is deliberate:
   is deterministic, so its `random_state` has no numerical effect; and
   `SequentialFeatureSelector` is deterministic given the fixed CV. Consequently
   **only MORSE and the SO-GA vary with the seed** — the forward-stepwise and
-  all-features baselines are identical across all seeds.
+  all-features baselines are identical across all seeds. The notebook
+  therefore computes them **once** (before the seed pool starts) and copies the
+  result into every seed's checkpoint; `checkpoint_utils.require_fixed_cv`
+  refuses a splitter whose folds would depend on the seed. (Selecting features
+  with a different CV split does change the SFS result — its selected sets
+  overlap only about 30–50% between splits — so the fixed folds are what makes
+  it look stable.)
 - **Why this design.** The goal here is to characterise the **algorithmic
   randomness** of the evolutionary optimiser — its run-to-run stability and
   central tendency on a fixed data partition — *without* confounding it with

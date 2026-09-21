@@ -10,6 +10,9 @@ Layout, under `<run directory>/checkpoints/training/`:
 
     fingerprint.json      what the checkpoints belong to (training configuration, CV
                           settings, feature names, hashes of the training data)
+    shared_baselines.json the forward-stepwise and all-features masks: they do not
+                          depend on the seed, so they are computed ONCE and copied
+                          into every seed
     seed_<N>/
         morse_front.csv   every Pareto individual: AUC, sign consistency, feature
                           count and the feature mask as a 0/1 string
@@ -24,6 +27,12 @@ Design rules
     is written after all the other files, so a crash can never leave a checkpoint
     that looks complete but is not.
   * Each seed is saved by the worker that trained it, at the moment it finishes.
+  * Forward stepwise selection and the all-features model give the same result for
+    every seed (fixed CV random_state shared by all seeds, deterministic lbfgs
+    logistic regression whose random_state is ignored, greedy selection without a
+    random component), so they are computed once -- before the seed pool starts --
+    and the result is copied into every seed's checkpoint. `require_fixed_cv` guards
+    the CV precondition.
   * A checkpoint folder carries a fingerprint. Resuming with different data or
     different settings raises `CheckpointMismatchError` instead of silently mixing
     results; a change of the algorithm source code only warns.
@@ -40,6 +49,7 @@ import hashlib
 import inspect
 import io
 import json
+import numbers
 import os
 import platform
 import shutil
@@ -60,6 +70,7 @@ from training_utils import ensure_directory
 SCHEMA_VERSION: int = 1
 
 FINGERPRINT_FILE: str = "fingerprint.json"
+SHARED_BASELINES_FILE: str = "shared_baselines.json"
 FRONT_FILE: str = "morse_front.csv"
 SELECTIONS_FILE: str = "selections.json"
 MARKER_FILE: str = "complete.json"
@@ -265,9 +276,46 @@ def compare_fingerprints(saved: dict[str, Any], current: dict[str, Any]) -> tupl
     return problems, notes
 
 
+def require_fixed_cv(cv: Any) -> None:
+    """Raise `ValueError` unless the splitter gives the same folds on every call
+    (no shuffling, or shuffling with an integer `random_state`).
+
+    Forward stepwise selection is only independent of the seed -- and can therefore
+    be computed once and copied into every seed -- if every seed sees the same folds.
+    With `shuffle=True` and `random_state=None` (or a RandomState instance) the folds
+    would come from the global random state, which differs from seed to seed.
+    """
+    if getattr(cv, "shuffle", False) and not isinstance(cv.random_state, numbers.Integral):
+        raise ValueError(
+            f"the CV splitter shuffles with random_state={cv.random_state!r}, which gives different "
+            f"folds on every call, so forward stepwise selection would depend on the seed and cannot "
+            f"be computed once for all seeds. Give the splitter an integer random_state.")
+
+
 # ---------------------------------------------------------------------------
 # Per-seed training results
 # ---------------------------------------------------------------------------
+
+@dataclass
+class SharedBaselines:
+    """The two baselines that do not depend on the seed and are therefore computed
+    once and copied into every seed.
+
+    Forward stepwise selection (SFS) and the all-features model give the same result
+    for every seed: the cross-validation splitter is shared and has a fixed
+    `random_state`, so every seed sees the same folds; `LogisticRegression` uses the
+    deterministic lbfgs solver, which ignores its `random_state`; and the greedy
+    selection itself has no random component. (Checked on the arrhythmia and
+    RadFusion data: SFS selects identical features for different seeds.)
+
+    forward_mask: the forward-stepwise-selection mask.
+    all_mask:     the all-features mask.
+    seconds:      wall-clock time it took to compute them (informational).
+    """
+    forward_mask: list[int]
+    all_mask: list[int]
+    seconds: float = 0.0
+
 
 @dataclass
 class SeedTrainingResult:
@@ -345,6 +393,31 @@ class TrainingCheckpointStore:
                     f"{self._directory} contains seed checkpoints but no {FINGERPRINT_FILE}, so "
                     f"it cannot be verified that they belong to this data and configuration.")
             atomic_write_json(fingerprint_path, self._fingerprint)
+
+    # ---- seed-independent baselines ---------------------------------------------------------
+    def save_shared_baselines(self, baselines: SharedBaselines) -> None:
+        forward_mask: str = mask_to_string(baselines.forward_mask)
+        all_mask: str = mask_to_string(baselines.all_mask)
+        for text in (forward_mask, all_mask):
+            string_to_mask(text, self._n_features)  # length check
+        atomic_write_json(os.path.join(self._directory, SHARED_BASELINES_FILE), {
+            "schema_version": SCHEMA_VERSION,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "seconds": round(float(baselines.seconds), 1),
+            "sfs": {"mask": forward_mask},
+            "all_features": {"mask": all_mask},
+        })
+
+    def load_shared_baselines(self) -> SharedBaselines | None:
+        """The saved seed-independent baselines, or None if they were never computed."""
+        path: str = os.path.join(self._directory, SHARED_BASELINES_FILE)
+        if not os.path.isfile(path):
+            return None
+        saved: dict[str, Any] = read_json(path)
+        return SharedBaselines(
+            forward_mask=string_to_mask(saved["sfs"]["mask"], self._n_features),
+            all_mask=string_to_mask(saved["all_features"]["mask"], self._n_features),
+            seconds=float(saved["seconds"]))
 
     # ---- which seeds are done ---------------------------------------------------------------
     def _seed_directories(self) -> list[int]:
@@ -482,11 +555,27 @@ def import_results(
         everything: dict[int, list[int]]) -> None:
     """Write results that already exist in memory to `store` -- for example the
     `training_results_*` dictionaries of a run that started before checkpointing
-    existed and is still alive in the kernel -- so that they survive a restart."""
+    existed and is still alive in the kernel -- so that they survive a restart.
+
+    The SFS and all-features masks should be identical for every seed (see
+    `SharedBaselines`); if they are, they are also saved as the shared baselines so
+    that a later resume does not compute them again. If they differ, something
+    unexpected happened: a warning is issued and the shared baselines are not saved.
+    """
     for seed in seeds:
         store.save_seed(SeedTrainingResult(
             seed=seed, pareto_front=multi[seed], single_best=single[seed],
             forward_mask=forward[seed], all_mask=everything[seed]))
+
+    if not seeds:
+        return
+    if len({tuple(forward[seed]) for seed in seeds}) == 1 and len({tuple(everything[seed]) for seed in seeds}) == 1:
+        store.save_shared_baselines(SharedBaselines(
+            forward_mask=list(forward[seeds[0]]), all_mask=list(everything[seeds[0]])))
+    else:
+        warnings.warn(
+            "the forward-stepwise / all-features masks differ between the seeds although they should not "
+            "depend on the seed; the shared baselines were NOT saved", CheckpointWarning, stacklevel=2)
 
 
 # ---------------------------------------------------------------------------
@@ -501,16 +590,24 @@ def train_missing_seeds(
         store: TrainingCheckpointStore,
         seeds: Sequence[int],
         train_one_seed: Callable[[int], tuple],
+        compute_baselines: Callable[[], SharedBaselines],
         n_jobs: int = -1,
         log: Callable[[str], None] = _print_flushed) -> list[int]:
     """Train every seed that has no complete checkpoint yet and write each result
     to `store` the moment it is ready (by the worker that trained it), so nothing
     is lost if a later seed -- or the rest of the pipeline -- fails.
 
-    train_one_seed: seed -> (seed, pareto_front, single_best, forward_mask, all_mask),
-                    the per-seed training function of the notebook.
-    n_jobs:         1 = sequential in this process, otherwise a joblib/loky pool
-                    (-1 = all cores), one seed per worker.
+    train_one_seed:    seed -> (seed, pareto_front, single_best): the parts that
+                       depend on the seed, i.e. MORSE and the SO-GA.
+    compute_baselines: () -> SharedBaselines: forward stepwise selection and the
+                       all-features mask, which do NOT depend on the seed (see
+                       `SharedBaselines`). Called at most once per store -- in this
+                       process, before the pool starts, so it may use all cores
+                       itself -- and only if at least one seed has to be trained.
+                       The result is saved in the store and copied into every
+                       seed's checkpoint.
+    n_jobs:            1 = sequential in this process, otherwise a joblib/loky pool
+                       (-1 = all cores), one seed per worker.
 
     Returns the seeds that were trained in this call.
     """
@@ -520,14 +617,29 @@ def train_missing_seeds(
     if not missing:
         return []
 
+    baselines: SharedBaselines | None = store.load_shared_baselines()
+    if baselines is None:
+        log("Forward stepwise selection and the all-features baseline do not depend on the seed: "
+            "computing them once and copying the result into every seed...")
+        baselines_started: float = time.time()
+        baselines = compute_baselines()
+        baselines.seconds = time.time() - baselines_started
+        store.save_shared_baselines(baselines)
+        log(f"Seed-independent baselines done in {baselines.seconds / 60:.1f} min "
+            f"(SFS selected {sum(baselines.forward_mask)} of {len(baselines.forward_mask)} features).")
+    else:
+        log(f"Reusing the seed-independent baselines saved in {store.directory} "
+            f"(SFS: {sum(baselines.forward_mask)} of {len(baselines.forward_mask)} features).")
+
     def train_and_save(seed: int) -> int:
         started: float = time.time()
-        finished_seed, pareto_front, single_best, forward_mask, all_mask = train_one_seed(seed)
+        finished_seed, pareto_front, single_best = train_one_seed(seed)
         if finished_seed != seed:
             raise RuntimeError(f"train_one_seed({seed}) returned the results of seed {finished_seed}")
         store.save_seed(SeedTrainingResult(
             seed=seed, pareto_front=pareto_front, single_best=single_best,
-            forward_mask=forward_mask, all_mask=all_mask, seconds=time.time() - started))
+            forward_mask=list(baselines.forward_mask), all_mask=list(baselines.all_mask),
+            seconds=time.time() - started))
         return seed
 
     start: float = time.time()

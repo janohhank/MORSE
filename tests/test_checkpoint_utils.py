@@ -61,6 +61,18 @@ def result_from_tuple(values: tuple, seconds: float = 1.5) -> cu.SeedTrainingRes
     return cu.SeedTrainingResult(seed, front, single, forward, everything, seconds)
 
 
+def make_seed_only(seed: int) -> tuple:
+    """What the notebook's `_train_one_seed` returns now: only the parts that depend on the seed."""
+    seed, front, single, _, _ = make_seed_training(seed)
+    return seed, front, single
+
+
+def make_baselines(seconds: float = 0.5) -> cu.SharedBaselines:
+    """The seed-independent baselines, equal to the masks `make_seed_training` produces."""
+    _, _, _, forward, everything = make_seed_training(0)
+    return cu.SharedBaselines(forward_mask=forward, all_mask=everything, seconds=seconds)
+
+
 class MaskTests(unittest.TestCase):
     def test_round_trip(self):
         mask = [1, 0, 0, 1, 1, 0]
@@ -180,6 +192,16 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, r"\[3\]"):
             self.store.load_all([1, 3])
 
+    def test_shared_baselines_round_trip_and_validation(self):
+        self.assertIsNone(self.store.load_shared_baselines())
+        self.store.save_shared_baselines(make_baselines(seconds=12.34))
+        loaded = self.store.load_shared_baselines()
+        self.assertEqual(loaded.forward_mask, make_baselines().forward_mask)
+        self.assertEqual(loaded.all_mask, make_baselines().all_mask)
+        self.assertAlmostEqual(loaded.seconds, 12.3)
+        with self.assertRaises(ValueError):
+            self.store.save_shared_baselines(cu.SharedBaselines(forward_mask=[1, 0], all_mask=[1] * N_FEATURES))
+
     def test_import_results_from_memory(self):
         seeds = [4, 5]
         run = {seed: make_seed_training(seed) for seed in seeds}
@@ -190,6 +212,24 @@ class StoreTests(unittest.TestCase):
         multi, single, forward, everything = self.store.load_all(seeds)
         self.assertEqual([list(i) for i in multi[5]], [list(i) for i in run[5][1]])
         self.assertEqual(forward[4], run[4][3])
+        # the identical SFS / all-features masks of all seeds are also saved as the shared baselines
+        shared = self.store.load_shared_baselines()
+        self.assertEqual(shared.forward_mask, run[4][3])
+        self.assertEqual(shared.all_mask, run[4][4])
+
+    def test_import_results_warns_and_saves_no_shared_baselines_when_the_seeds_disagree(self):
+        seeds = [4, 5]
+        run = {seed: make_seed_training(seed) for seed in seeds}
+        other_forward = list(run[5][3])
+        other_forward[0] = 1 - other_forward[0]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cu.import_results(self.store, seeds,
+                              multi={s: run[s][1] for s in seeds}, single={s: run[s][2] for s in seeds},
+                              forward={4: run[4][3], 5: other_forward}, everything={s: run[s][4] for s in seeds})
+        self.assertTrue(any(issubclass(w.category, cu.CheckpointWarning) for w in caught))
+        self.assertEqual(self.store.completed_seeds(), seeds)
+        self.assertIsNone(self.store.load_shared_baselines())
 
     def test_prepare_verifies_the_fingerprint(self):
         # the same fingerprint is fine, also from a second store object (a "resumed" run)
@@ -230,58 +270,112 @@ class TrainMissingSeedsTests(unittest.TestCase):
         self.store = cu.TrainingCheckpointStore(os.path.join(self._temporary.name, "training"), make_fingerprint())
         self.store.prepare()
         self.messages: list[str] = []
+        self.seed_calls: list[int] = []
+        self.baseline_calls: list[int] = []
 
     def tearDown(self):
         self._temporary.cleanup()
 
+    def train_one_seed(self, seed):
+        self.seed_calls.append(seed)
+        return make_seed_only(seed)
+
+    def compute_baselines(self):
+        self.baseline_calls.append(1)
+        return make_baselines()
+
+    def run_training(self, seeds, n_jobs=1, train_one_seed=None, compute_baselines=None):
+        return cu.train_missing_seeds(
+            self.store, seeds, train_one_seed or self.train_one_seed, compute_baselines or self.compute_baselines,
+            n_jobs=n_jobs, log=self.messages.append)
+
     def test_sequential_run_then_resume_trains_only_what_is_missing(self):
-        calls: list[int] = []
-
-        def train_one_seed(seed):
-            calls.append(seed)
-            return make_seed_training(seed)
-
-        trained = cu.train_missing_seeds(self.store, [10, 11, 12], train_one_seed, n_jobs=1, log=self.messages.append)
-        self.assertEqual(trained, [10, 11, 12])
-        self.assertEqual(calls, [10, 11, 12])
+        self.assertEqual(self.run_training([10, 11, 12]), [10, 11, 12])
+        self.assertEqual(self.seed_calls, [10, 11, 12])
         self.assertEqual(self.store.completed_seeds(), [10, 11, 12])
 
         # a second call finds everything and trains nothing
-        self.assertEqual(cu.train_missing_seeds(self.store, [10, 11, 12], train_one_seed, n_jobs=1, log=self.messages.append), [])
-        self.assertEqual(calls, [10, 11, 12])
+        self.assertEqual(self.run_training([10, 11, 12]), [])
+        self.assertEqual(self.seed_calls, [10, 11, 12])
 
         # a crashed seed (marker missing) is retrained, an added seed is trained, the rest is kept
         os.remove(os.path.join(self.store.seed_directory(11), cu.MARKER_FILE))
-        trained = cu.train_missing_seeds(self.store, [10, 11, 12, 13], train_one_seed, n_jobs=1, log=self.messages.append)
-        self.assertEqual(trained, [11, 13])
-        self.assertEqual(calls, [10, 11, 12, 11, 13])
+        self.assertEqual(self.run_training([10, 11, 12, 13]), [11, 13])
+        self.assertEqual(self.seed_calls, [10, 11, 12, 11, 13])
         self.assertTrue(any("already have a checkpoint" in m for m in self.messages))
+
+    def test_the_seed_independent_baselines_are_computed_once_and_copied_into_every_seed(self):
+        self.run_training([10, 11, 12])
+        self.assertEqual(len(self.baseline_calls), 1)
+
+        expected = make_baselines()
+        multi, single, forward, everything = self.store.load_all([10, 11, 12])
+        for seed in (10, 11, 12):
+            self.assertEqual(forward[seed], expected.forward_mask)
+            self.assertEqual(everything[seed], expected.all_mask)
+        self.assertEqual(self.store.load_shared_baselines().forward_mask, expected.forward_mask)
+        self.assertTrue(os.path.isfile(os.path.join(self.store.directory, cu.SHARED_BASELINES_FILE)))
+
+        # ... and they are reused, not recomputed, when more seeds are trained later (even by another store object)
+        resumed = cu.TrainingCheckpointStore(self.store.directory, make_fingerprint())
+        resumed.prepare()
+
+        def must_not_run():
+            raise AssertionError("the baselines must be loaded from the store, not computed again")
+
+        cu.train_missing_seeds(resumed, [10, 11, 12, 13], self.train_one_seed, must_not_run, n_jobs=1,
+                               log=self.messages.append)
+        self.assertEqual(resumed.load_all([13])[2][13], expected.forward_mask)
+        self.assertTrue(any("Reusing the seed-independent baselines" in m for m in self.messages))
+
+    def test_the_baselines_are_not_computed_when_there_is_nothing_to_train(self):
+        for seed in (1, 2):
+            self.store.save_seed(result_from_tuple(make_seed_training(seed)))
+        self.assertEqual(self.run_training([1, 2]), [])
+        self.assertEqual(self.baseline_calls, [])
+        self.assertIsNone(self.store.load_shared_baselines())
 
     def test_seeds_finished_before_a_failure_stay_saved(self):
         def train_one_seed(seed):
             if seed == 22:
                 raise RuntimeError("boom")
-            return make_seed_training(seed)
+            return make_seed_only(seed)
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            cu.train_missing_seeds(self.store, [21, 22, 23], train_one_seed, n_jobs=1, log=self.messages.append)
+            self.run_training([21, 22, 23], train_one_seed=train_one_seed)
         self.assertEqual(self.store.completed_seeds(), [21])
         self.assertEqual(self.store.missing_seeds([21, 22, 23]), [22, 23])
+        self.assertIsNotNone(self.store.load_shared_baselines())  # computed before the first seed
 
     def test_a_result_of_the_wrong_seed_is_an_error(self):
         with self.assertRaisesRegex(RuntimeError, "results of seed"):
-            cu.train_missing_seeds(self.store, [30], lambda seed: make_seed_training(seed + 1), n_jobs=1,
-                                   log=self.messages.append)
+            self.run_training([30], train_one_seed=lambda seed: make_seed_only(seed + 1))
 
-    def test_parallel_workers_save_their_own_seeds(self):
+    def test_parallel_workers_save_their_own_seeds_with_the_shared_baselines(self):
         def train_one_seed(seed):
-            return make_seed_training(seed)
+            return make_seed_only(seed)
 
-        trained = cu.train_missing_seeds(self.store, [40, 41], train_one_seed, n_jobs=2, log=self.messages.append)
+        trained = self.run_training([40, 41], n_jobs=2, train_one_seed=train_one_seed)
         self.assertEqual(sorted(trained), [40, 41])
+        self.assertEqual(len(self.baseline_calls), 1)  # in the parent process, once
         multi, single, forward, everything = self.store.load_all([40, 41])
         self.assertEqual(sorted(multi), [40, 41])
         self.assertEqual(list(single[41]), [1, 0] * (N_FEATURES // 2))
+        self.assertEqual(forward[40], make_baselines().forward_mask)
+        self.assertEqual(forward[41], make_baselines().forward_mask)
+        self.assertEqual(everything[41], [1] * N_FEATURES)
+
+
+class RequireFixedCvTests(unittest.TestCase):
+    def test_fixed_splitters_are_accepted(self):
+        cu.require_fixed_cv(StratifiedKFold(n_splits=3, shuffle=True, random_state=42))
+        cu.require_fixed_cv(StratifiedKFold(n_splits=3, shuffle=True, random_state=numpy.int64(7)))
+        cu.require_fixed_cv(StratifiedKFold(n_splits=3))                  # no shuffling: always the same folds
+
+    def test_splitters_that_depend_on_the_global_random_state_are_refused(self):
+        for random_state in (None, numpy.random.RandomState(1)):
+            with self.assertRaisesRegex(ValueError, "cannot be computed once"):
+                cu.require_fixed_cv(StratifiedKFold(n_splits=3, shuffle=True, random_state=random_state))
 
 
 class AtomicWriteTests(unittest.TestCase):
