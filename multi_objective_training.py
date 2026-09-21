@@ -11,6 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
+from deap_types import ensure_multi_objective_types
 from training_config import TrainingConfig
 from training_utils import save_stats_csv
 from plot_utils import plot_multi_objective_convergence, plot_pareto_front
@@ -138,11 +139,7 @@ class MultiObjectiveTraining:
         return numpy.mean(auc_scores), numpy.mean(sign_scores)
 
     def run(self) -> list[creator.Individual]:
-        if "FitnessMulti" not in creator.__dict__:
-            creator.create("FitnessMulti", base.Fitness, weights=(1.0, 1.0))
-
-        if "Individual" not in creator.__dict__:
-            creator.create("Individual", list, fitness=creator.FitnessMulti)
+        ensure_multi_objective_types()
 
         toolbox: base.Toolbox = base.Toolbox()
 

@@ -11,6 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import StratifiedKFold
 
+from deap_types import ensure_single_objective_types
 from training_config import TrainingConfig
 from training_utils import save_stats_csv
 from plot_utils import plot_single_objective_convergence
@@ -94,11 +95,7 @@ class SingleObjectiveTraining:
         return (numpy.mean(auc_scores),)
 
     def run(self) -> creator.Individual:
-        if "FitnessSingle" not in creator.__dict__:
-            creator.create("FitnessSingle", base.Fitness, weights=(1.0,))
-
-        if "IndividualSingle" not in creator.__dict__:
-            creator.create("IndividualSingle", list, fitness=creator.FitnessSingle)
+        ensure_single_objective_types()
 
         toolbox: base.Toolbox = base.Toolbox()
 

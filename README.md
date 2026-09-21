@@ -93,7 +93,11 @@ seed varies — this is a deliberate design choice.
 ├── plot_utils.py                    # All figures (convergence, Pareto, noise, etc.)
 ├── evaluation_utils.py              # Marginal correlations, noise injection, model
 │                                    #   build/eval, balanced sens/spec threshold
+├── checkpoint_utils.py              # Per-seed training checkpoints (Pareto fronts, masks)
+│                                    #   and resuming a run
+├── deap_types.py                    # The DEAP fitness / individual classes (one definition)
 ├── requirements.txt                 # Pinned dependency set
+├── tests/                           # Unit tests: python -m unittest discover -s tests -v
 │
 ├── arrhythmia/                      # UCI Arrhythmia dataset + preparation notebook
 │   ├── arrhythmia.data
@@ -127,6 +131,8 @@ data through its official access pathway and add a matching config block.
 | `training_utils` | `save_stats_csv`, `ensure_directory`, and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×covariate-shift heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
 | `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (prevalence-preserving noise on binary dummy features), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
+| `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
+| `deap_types` | The DEAP fitness / individual classes (`FitnessMulti` / `Individual`, `FitnessSingle` / `IndividualSingle`), defined once for the trainers, the notebook and the checkpoint loader. |
 
 ---
 
@@ -170,7 +176,9 @@ leaks into the training data.
 3. Optionally edit the run switches in the same cell:
    - `N_JOBS` (default `-1`, all cores; one worker process per seed),
    - `USE_KNEE_POINT_SELECTION` (default `True`),
-   - `USE_ROC_AUC` (default `False` → PR-AUC is the main objective/metric).
+   - `USE_ROC_AUC` (default `False` → PR-AUC is the main objective/metric),
+   - `RESUME_FROM` (default `None`; the result directory of an earlier run to
+     continue without retraining, see [Checkpoints](#checkpoints-and-resuming-a-run)).
 4. **Run all cells.** Outputs are written to a timestamped directory in the
    working folder:
 
@@ -178,12 +186,49 @@ leaks into the training data.
 YYYY-MM-DD_HH-MM-SS/
 ├── multi/seed_<N>/                       # convergence.csv, convergence.png, pareto_front.png
 ├── single/seed_<N>/                      # convergence.csv, convergence.png
+├── checkpoints/training/                 # fingerprint.json + seed_<N>/ (morse_front.csv, selections.json, complete.json)
 └── evaluation/
     ├── all_models_comparison/            # 4-model noise-robustness curves + 2-D heatmap grid + per-seed CSVs
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
     ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
     └── best_morse_model/                 # best-seed metrics CSV + sensitivity/specificity curve PDF
 ```
+
+### Checkpoints and resuming a run
+
+Training is the slow part (tens of minutes for 20 seeds); the evaluation after
+it takes minutes. Every seed is therefore written to
+`<run>/checkpoints/training/seed_<N>/` **the moment its four methods are done**
+(by the worker that trained it):
+
+- `morse_front.csv` — every Pareto individual of MORSE: AUC, sign
+  consistency, feature count and the feature mask as a 0/1 string (in the
+  feature order of the dataset),
+- `selections.json` — the SO-GA best individual (mask + fitness), the SFS
+  mask and the all-features mask,
+- `complete.json` — written last; a seed without it counts as not trained, so
+  a crash in the middle of a write can never leave a checkpoint that only
+  looks complete.
+
+Everything is plain CSV/JSON, written atomically: the files are readable,
+usable for the paper (fronts, masks) and independent of library versions.
+`fingerprint.json` records the training configuration, the cross-validation
+settings, the feature names and hashes of the training data. The fitted
+logistic-regression packages of the evaluation are deliberately not stored:
+they are rebuilt from the masks in seconds.
+
+To continue after a failure (a crash in the evaluation, an interrupted
+training, a lost kernel): restart the kernel, set
+`RESUME_FROM = "<result directory>"` in cell 2 and run all cells. Training
+then loads the seeds that have a checkpoint and trains only the missing ones;
+the evaluation runs again into the same directory. Resuming with different
+data or settings raises `CheckpointMismatchError` (listing what differs)
+instead of mixing results, while a change of the algorithm source code only
+warns. Runs made before checkpointing existed cannot be resumed — unless their
+kernel is still alive: create the store exactly as in cell 9 and call
+`import_results(training_store, seeds, training_results_multi,
+training_results_single, training_results_fwd, training_results_all)` to write
+the results that are in memory to disk.
 
 ### Numerical reproducibility
 
