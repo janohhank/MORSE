@@ -10,3 +10,10 @@ __pycache__/
 
 # Timestamped pipeline output directories (YYYY-MM-DD_HH-MM-SS/)
 [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+
+# College Scorecard raw download (~120 MB total; public domain, regenerable -- see the URL in
+# college_scorecard_data_preparation.ipynb). The small preprocessed CSVs and the data dictionary
+# are still tracked.
+college_scorecard/Most-Recent-Cohorts-Institution.csv
+college_scorecard/Most-Recent-Cohorts-Institution.zip
+college_scorecard/__MACOSX/
