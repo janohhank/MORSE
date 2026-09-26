@@ -8,11 +8,11 @@ class TrainingConfig:
     # Bigger population -> bigger search space
     pop_size: int = 188
     # Bigger generation number -> bigger convergence
-    ngen: int = 285
+    ngen: int = 650
     # Crossing probability
     cxpb: float = 0.5
     # Mutation probability
-    mutpb: float = 0.2
+    mutpb: float = 0.3
     # Use ROC-AUC instead of PR-AUC
     use_roc_auc: bool = True
     # Directory to save results

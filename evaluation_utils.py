@@ -5,9 +5,8 @@ import numpy
 import pandas
 import matplotlib
 matplotlib.use("Agg")
-from scipy.stats import pointbiserialr
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import matthews_corrcoef, roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
 # numpy 2.0 renamed `trapz` to `trapezoid` and later fully removed `trapz`
@@ -26,29 +25,40 @@ def compute_marginal_correlations(
 ) -> numpy.ndarray:
     """Per-feature marginal correlation with the binary target `y`.
 
-    - Matthews correlation for columns with exactly 2 unique values.
-    - Point-biserial correlation for columns with more than 2 unique values.
-    - 0 for constant columns.
+    The Pearson correlation of every column with `y`. For a binary (0/1)
+    column this IS the phi (Matthews) coefficient and for any other column it
+    IS the point-biserial correlation -- the two measures the method
+    prescribes -- so one formula covers both. Constant columns get 0.
+
+    The value does not depend on the location or the scale of a column, and it
+    must not: the GA calls this function on STANDARDISED fold data
+    (MultiObjectiveTraining), the evaluation on the raw training data. An
+    earlier version computed the Matthews coefficient of `feat.astype(int)` for
+    two-valued columns. On standardised data that cast turns a 0/1 column whose
+    prevalence exceeds 0.5 into {-k, 0} -- the 1s become 0 -- and sklearn's
+    multiclass Matthews coefficient then has the OPPOSITE sign (and half the
+    magnitude when the 1s cast to 2 or more). The GA's sign-consistency
+    objective therefore used the reversed reference direction for exactly those
+    inputs (7 inputs of College Scorecard, 1 of arrhythmia, 15 of RadFusion in
+    the 2026-09-25 runs), while the evaluation on raw data was right.
 
     Returns a numpy array of length `X.shape[1]`, aligned with the column
     order of `X`.
     """
     X_arr: numpy.ndarray = (X.to_numpy(dtype=float) if hasattr(X, "to_numpy")
                             else numpy.asarray(X, dtype=float))
-    y_int: numpy.ndarray = numpy.asarray(y, dtype=int)
-    n_features: int = X_arr.shape[1]
+    y_arr: numpy.ndarray = numpy.asarray(y, dtype=float)
 
-    out: numpy.ndarray = numpy.zeros(n_features, dtype=float)
-    for j in range(n_features):
-        feat: numpy.ndarray = X_arr[:, j]
-        u: int = len(numpy.unique(feat))
-        if u <= 1:
-            out[j] = 0.0
-        elif u == 2:
-            out[j] = float(matthews_corrcoef(y_int, feat.astype(int)))
-        else:
-            corr, _ = pointbiserialr(y_int, feat)
-            out[j] = float(corr)
+    out: numpy.ndarray = numpy.zeros(X_arr.shape[1], dtype=float)
+    # Constant columns (and a constant target) have no correlation. Test it
+    # exactly with ptp: centring a constant column can leave rounding noise.
+    varying: numpy.ndarray = numpy.ptp(X_arr, axis=0) > 0
+    if numpy.ptp(y_arr) == 0 or not varying.any():
+        return out
+    X_centred: numpy.ndarray = X_arr[:, varying] - X_arr[:, varying].mean(axis=0)
+    y_centred: numpy.ndarray = y_arr - y_arr.mean()
+    out[varying] = (y_centred @ X_centred) / numpy.sqrt(
+        (X_centred ** 2).sum(axis=0) * (y_centred ** 2).sum())
     return out
 
 
