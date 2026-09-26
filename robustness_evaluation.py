@@ -597,7 +597,9 @@ def partial_spearman(x: numpy.ndarray, y: numpy.ndarray, z: numpy.ndarray) -> fl
     design: numpy.ndarray = numpy.column_stack([numpy.ones_like(rz), rz])
     ex: numpy.ndarray = rx - design @ numpy.linalg.lstsq(design, rx, rcond=None)[0]
     ey: numpy.ndarray = ry - design @ numpy.linalg.lstsq(design, ry, rcond=None)[0]
-    if ex.std() == 0 or ey.std() == 0:
+    # undefined when x or y is constant or fully explained by z; the residuals are then ~1e-16 rounding
+    # noise rather than exactly zero, so compare with a tolerance (ranks are of the order of n)
+    if ex.std() < 1e-9 or ey.std() < 1e-9:
         return float("nan")
     return float(numpy.corrcoef(ex, ey)[0, 1])
 

@@ -4,13 +4,18 @@ Run from the repository root:
 
     python -m unittest discover -s tests -v
 """
+import contextlib
+import importlib
 import inspect
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
 import warnings
+from importlib import metadata
+from unittest import mock
 
 import numpy
 from deap import creator
@@ -398,6 +403,85 @@ class SharedTypesTests(unittest.TestCase):
     def test_the_trainers_use_the_shared_definitions(self):
         self.assertIn("ensure_multi_objective_types()", inspect.getsource(MultiObjectiveTraining.run))
         self.assertIn("ensure_single_objective_types()", inspect.getsource(SingleObjectiveTraining.run))
+
+
+class EdgeCaseTests(unittest.TestCase):
+    """The error and fallback paths of checkpoint_utils."""
+
+    def test_a_failed_write_leaves_no_temporary_file_and_keeps_the_old_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "file.json")
+            cu.atomic_write_json(path, {"a": 1})
+            with mock.patch.object(cu.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    cu.atomic_write_json(path, {"a": 2})
+            self.assertEqual(cu.read_json(path), {"a": 1})
+            self.assertEqual(os.listdir(directory), ["file.json"])
+
+    def test_objects_without_a_source_file_are_skipped_in_the_source_fingerprint(self):
+        extension = importlib.import_module("numpy._core._multiarray_umath")     # a compiled module
+        hashes = cu.source_fingerprint([extension, cu.TrainingCheckpointStore])
+        self.assertEqual(list(hashes), ["checkpoint_utils.py"])
+
+    def test_missing_packages_are_reported_as_unknown(self):
+        with mock.patch.object(cu.metadata, "version", side_effect=metadata.PackageNotFoundError("x")):
+            versions = cu._library_versions()
+        self.assertEqual({key: value for key, value in versions.items() if key != "python"},
+                         {"numpy": "unknown", "scikit-learn": "unknown", "deap": "unknown"})
+
+    def test_added_and_removed_source_files_are_described(self):
+        base = make_fingerprint(code_objects=(cu.TrainingCheckpointStore,))
+        without = json.loads(json.dumps(base))
+        without["environment"]["source_sha256"] = {}
+        _, notes = cu.compare_fingerprints(without, base)
+        self.assertTrue(any("checkpoint_utils.py is new since" in note for note in notes), notes)
+        _, notes = cu.compare_fingerprints(base, without)
+        self.assertTrue(any("checkpoint_utils.py is no longer part of the code" in note for note in notes), notes)
+
+    def test_a_different_schema_version_is_a_problem(self):
+        base = make_fingerprint()
+        older = dict(base, schema_version=base["schema_version"] - 1)
+        problems, _ = cu.compare_fingerprints(older, base)
+        self.assertTrue(any(problem.startswith("schema_version") for problem in problems), problems)
+
+    def test_an_individual_without_a_fitness_is_refused(self):
+        seed, front, single, forward, everything = make_seed_training(3)
+        unevaluated = creator.Individual([1] * N_FEATURES)          # fitness never set
+        with tempfile.TemporaryDirectory() as directory:
+            store = cu.TrainingCheckpointStore(directory, make_fingerprint())
+            store.prepare()
+            with self.assertRaisesRegex(ValueError, "no valid fitness"):
+                store.save_seed(cu.SeedTrainingResult(seed, front + [unevaluated], single, forward, everything))
+
+    def test_a_front_that_disagrees_with_its_marker_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = cu.TrainingCheckpointStore(directory, make_fingerprint())
+            store.prepare()
+            store.save_seed(result_from_tuple(make_seed_training(4)))
+            marker_path = os.path.join(store.seed_directory(4), cu.MARKER_FILE)
+            marker = cu.read_json(marker_path)
+            marker["front_size"] += 1
+            cu.atomic_write_json(marker_path, marker)
+            with self.assertRaisesRegex(ValueError, "rows but the marker says"):
+                store.load_seed(4)
+
+    def test_importing_no_seeds_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = cu.TrainingCheckpointStore(directory, make_fingerprint())
+            store.prepare()
+            cu.import_results(store, [], {}, {}, {}, {})
+            self.assertIsNone(store.load_shared_baselines())
+            self.assertEqual(store.completed_seeds(), [])
+
+    def test_the_default_log_prints_to_stdout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = cu.TrainingCheckpointStore(directory, make_fingerprint())
+            store.prepare()
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                trained = cu.train_missing_seeds(store, [], make_seed_only, make_baselines)
+        self.assertEqual(trained, [])
+        self.assertIn("0 of 0 seeds already have a checkpoint", printed.getvalue())
 
 
 if __name__ == "__main__":

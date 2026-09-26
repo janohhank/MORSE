@@ -809,6 +809,8 @@ class CorruptionBank:
 
     # ---- random draws (made once per family and repetition) --------------------------------------------
     def _draw(self, family: str, repetition: int) -> dict[str, numpy.ndarray]:
+        if family not in CORRUPTION_FAMILIES:
+            raise ValueError(f"unknown corruption family {family!r}; known: {CORRUPTION_FAMILIES}")
         key: tuple[str, int] = (family, repetition)
         if key not in self._draws:
             if not 0 <= repetition < self._repetitions:
@@ -822,10 +824,8 @@ class CorruptionBank:
                                     "value": rng.random((n_rows, len(self._redraw_units)))}
             elif family == "under_recording":
                 self._draws[key] = {"select": rng.random((n_rows, len(self._under_units)))}
-            elif family == "value_masking":
+            else:   # value_masking
                 self._draws[key] = {"select": rng.random((n_rows, len(self._mask_units)))}
-            else:
-                raise ValueError(f"unknown corruption family {family!r}; known: {CORRUPTION_FAMILIES}")
         return self._draws[key]
 
     # ---- corrupted data ---------------------------------------------------------------------------------

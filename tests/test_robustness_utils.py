@@ -16,11 +16,11 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from robustness_config import RobustnessConfig  # noqa: E402
-from robustness_utils import (CorruptionBank, DependenceTilt, NormalScores, calibrate_strength,  # noqa: E402
-                              calibrate_strengths, dependence_pairs, effective_sample_fraction,
-                              exponential_tilt, infer_feature_schema, normalise_within_classes,
-                              population_axes, weighted_average_precision, weighted_correlation,
-                              weighted_roc_auc)
+from robustness_utils import (BALANCE_TOLERANCE, CorruptionBank, DependenceTilt, NormalScores,  # noqa: E402
+                              calibrate_strength, calibrate_strengths, class_effective_sizes, dependence_pairs,
+                              effective_sample_fraction, exponential_tilt, infer_feature_schema,
+                              normalise_within_classes, population_axes, weighted_average_precision,
+                              weighted_correlation, weighted_roc_auc)
 
 FILL: float = 5.0
 
@@ -292,6 +292,200 @@ class CorruptionTests(unittest.TestCase):
         unavailable = clean["lab_measured"] == 0
         self.assertTrue((noisy.loc[unavailable, "lab"] == FILL).all())
         self.assertTrue((noisy.loc[~unavailable, "lab"] != clean.loc[~unavailable, "lab"]).all())
+
+
+def make_availability_data(n: int, seed: int) -> pandas.DataFrame:
+    """Two values with availability flags that are linked, like College Scorecard's admission rates:
+      rate / rate:missing           missing in 20% of the rows (fill 0.75), never when reports_rate = 1
+      rate_all / rate_all:missing   missing in 10% of the rows (fill 0.5), only where rate is missing too
+      reports_rate                  a 0/1 input: 1 = the rate is always reported
+    so rate_all:missing = 1 without rate:missing = 1, and rate:missing = 1 with reports_rate = 1, never occur."""
+    rng = numpy.random.default_rng(seed)
+    reports = (rng.random(n) < 0.4).astype(int)
+    rate_missing = ((rng.random(n) < 1 / 3) & (reports == 0)).astype(int)
+    rate_all_missing = rate_missing * (rng.random(n) < 0.5).astype(int)
+    return pandas.DataFrame({
+        "x": rng.normal(size=n),
+        "rate": numpy.where(rate_missing == 1, 0.75, rng.uniform(0.1, 0.9, n)),
+        "rate_all": numpy.where(rate_all_missing == 1, 0.5, rng.uniform(0.1, 0.9, n)),
+        "rate:missing": rate_missing, "rate_all:missing": rate_all_missing, "reports_rate": reports})
+
+
+class ConfigTests(unittest.TestCase):
+    def test_defaults_are_valid_and_serialisable(self):
+        config = RobustnessConfig()
+        self.assertEqual(config.to_dict()["ess_levels"], (0.9, 0.8, 0.7, 0.6))
+        self.assertIn(config.headline_ess, config.ess_levels)
+
+    def test_invalid_settings_are_refused(self):
+        invalid = [
+            {"ess_levels": ()}, {"ess_levels": (0.9, 1.0)}, {"ess_levels": (0.6, 0.8), "headline_ess": 0.6},
+            {"corruption_levels": (0.0, 0.5)}, {"corruption_levels": (0.5, 0.2), "headline_corruption_level": 0.5},
+            {"headline_ess": 0.5}, {"headline_corruption_level": 0.55},
+            {"pair_min_abs_correlation": 0.6, "pair_max_abs_correlation": 0.5},
+            {"corruption_repetitions": 0}, {"max_pairs": -1}, {"population_components": -1}]
+        for settings in invalid:
+            with self.assertRaises(ValueError, msg=str(settings)):
+                RobustnessConfig(**settings)
+
+
+class CalibrationEdgeCaseTests(unittest.TestCase):
+    def test_invalid_targets_are_refused(self):
+        with self.assertRaises(ValueError):
+            calibrate_strengths(lambda s: 1.0, [1.2])
+        with self.assertRaises(ValueError):
+            calibrate_strengths(lambda s: 1.0, [0.6, 0.8])
+        with self.assertRaises(ValueError):
+            NormalScores([])
+
+    def test_an_inconsistent_ess_function_is_reported_as_saturated(self):
+        calls = {"n": 0}
+
+        def ess(strength: float) -> float:
+            # decreases while the bracket is searched (5 calls), then answers "no shift" for every
+            # strength, so the root finder sees no sign change inside the bracket
+            calls["n"] += 1
+            return max(0.0, 1.0 - strength) if calls["n"] <= 5 else 1.0
+
+        self.assertEqual(calibrate_strengths(ess, [0.6]), [(20.0, True)])
+
+    def test_a_target_the_function_jumps_over_is_reported_as_saturated(self):
+        results = calibrate_strengths(lambda s: 1.0 if s < 0.5 else 0.3, [0.9, 0.6])
+        self.assertEqual(results, [(20.0, True), (20.0, True)])
+
+    def test_class_effective_sizes(self):
+        negatives, positives = class_effective_sizes(numpy.array([1.0, 1.0, 2.0, 0.0]), numpy.array([0, 0, 1, 1]))
+        self.assertEqual((negatives, positives), (2.0, 1.0))
+
+
+class SchemaEdgeCaseTests(unittest.TestCase):
+    def test_missing_values_are_refused(self):
+        with self.assertRaises(ValueError):
+            infer_feature_schema(pandas.DataFrame({"a": [1.0, numpy.nan, 2.0]}))
+
+    def test_constant_and_two_valued_inputs(self):
+        rng = numpy.random.default_rng(3)
+        frame = pandas.DataFrame({"const": numpy.ones(100), "two": rng.choice([2.0, 5.0], 100),
+                                  "flag": (rng.random(100) < 0.5).astype(int)})
+        schema = infer_feature_schema(frame)
+        self.assertEqual((schema.constant, schema.other, schema.binary, schema.continuous),
+                         (["const"], ["two"], ["flag"], []))
+        # no continuous input: no value/availability pairs; a single 0/1 input: no forbidden combinations
+        self.assertEqual((schema.value_indicators, schema.forbidden), ([], []))
+        summary = schema.summary()
+        self.assertEqual((summary["constant"], summary["other"], summary["binary"]), (1, 1, 1))
+        self.assertEqual(set(schema.to_dict()), {"summary", "binary", "continuous", "constant", "other",
+                                                 "one_hot_groups", "value_indicators", "forbidden_combinations",
+                                                 "stand_alone_binary", "under_recording_inputs"})
+
+    def test_a_flag_level_with_too_few_rows_is_no_availability_flag(self):
+        rng = numpy.random.default_rng(4)
+        flag = numpy.zeros(300, dtype=int)
+        flag[:5] = 1                                              # 5 rows < value_indicator_min_rows
+        value = numpy.where(flag == 1, 9.0, rng.normal(size=300))
+        schema = infer_feature_schema(pandas.DataFrame({"value": value, "flag": flag}))
+        self.assertEqual(schema.value_indicators, [])
+
+    def test_dependence_pairs_need_two_inputs_and_enough_rows(self):
+        rng = numpy.random.default_rng(5)
+        single = pandas.DataFrame({"x": rng.normal(size=200)})
+        self.assertEqual(dependence_pairs(single, single, infer_feature_schema(single)), ([], 0))
+        x = rng.normal(size=400)
+        rare = numpy.zeros(400, dtype=int)
+        rare[numpy.argsort(x)[-15:]] = 1                          # 15 ones: correlated with x, but < 20 rows
+        frame = pandas.DataFrame({"x": x, "rare": rare})
+        self.assertGreater(abs(numpy.corrcoef(x, rare)[0, 1]), 0.3)
+        self.assertEqual(dependence_pairs(frame, frame, infer_feature_schema(frame)), ([], 0))
+
+
+class UnbalanceableTiltTests(unittest.TestCase):
+    def test_a_dependence_that_cannot_be_strengthened_with_fixed_moments_gives_nan(self):
+        rng = numpy.random.default_rng(0)
+        a = rng.integers(0, 10, 400).astype(float)
+        b = numpy.round(a + rng.normal(scale=0.3, size=a.size))       # r = 0.995 with ten values
+        tilt = DependenceTilt(a, b, a, b, False, False, clip=2.5)
+        self.assertLess(tilt.train_ess(-5.0), 0.99)                    # weakening works
+        self.assertLess(tilt.balance_error, BALANCE_TOLERANCE)
+        self.assertTrue(numpy.isnan(tilt.train_ess(20.0)))             # strengthening that far does not
+        self.assertGreater(tilt.balance_error, BALANCE_TOLERANCE)
+        self.assertEqual(calibrate_strengths(tilt.train_ess, [0.8, 0.6]), [(20.0, True), (20.0, True)])
+
+
+class CorruptionBankErrorTests(unittest.TestCase):
+    def setUp(self):
+        X, _ = make_data(300, seed=12)
+        self.bank = CorruptionBank(infer_feature_schema(X), X, X, repetitions=2, seed=1)
+
+    def test_invalid_requests_are_refused(self):
+        with self.assertRaises(ValueError):
+            self.bank.corrupt("gaussian_noise", 1.5, 0)
+        with self.assertRaises(ValueError):
+            self.bank.corrupt("gaussian_noise", 0.5, 2)                # only repetitions 0 and 1 exist
+        with self.assertRaises(ValueError):
+            self.bank.corrupt("salt_and_pepper", 0.5, 0)
+
+    def test_describe_counts_the_units(self):
+        self.assertEqual(self.bank.describe(), {"gaussian_noise": 3, "binary_redraw": 11, "under_recording": 6,
+                                                "value_masking": 1})
+
+    def test_only_continuous_inputs(self):
+        rng = numpy.random.default_rng(13)
+        frame = pandas.DataFrame({"a": rng.normal(size=100), "b": rng.normal(size=100)})
+        bank = CorruptionBank(infer_feature_schema(frame), frame, frame, repetitions=1, seed=2)
+        self.assertEqual(bank.applicable_families(), ["gaussian_noise"])
+        noisy, counts = bank.corrupt("gaussian_noise", 0.5, 0)
+        self.assertEqual(counts["changed"], 200)
+        self.assertFalse(noisy.equals(frame))
+
+
+class LinkedAvailabilityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.X = make_availability_data(3000, seed=14)
+        cls.X_test = make_availability_data(1000, seed=15)
+        cls.schema = infer_feature_schema(cls.X)
+        cls.bank = CorruptionBank(cls.schema, cls.X, cls.X_test, repetitions=2, seed=3)
+
+    def test_the_schema_finds_both_flags_and_their_links(self):
+        indicators = {i.flag: (i.off_level, i.fills) for i in self.schema.value_indicators}
+        self.assertEqual(indicators, {"rate:missing": (1, {"rate": 0.75}), "rate_all:missing": (1, {"rate_all": 0.5})})
+        forbidden = {(f.a, f.a_value, f.b, f.b_value) for f in self.schema.forbidden}
+        self.assertIn(("rate:missing", 0, "rate_all:missing", 1), forbidden)     # rate_all missing => rate missing
+        self.assertIn(("rate:missing", 1, "reports_rate", 1), forbidden)          # reported => not missing
+
+    def check_valid(self, corrupted: pandas.DataFrame) -> None:
+        self.assertFalse(((corrupted["rate_all:missing"] == 1) & (corrupted["rate:missing"] == 0)).any())
+        self.assertFalse(((corrupted["rate:missing"] == 1) & (corrupted["reports_rate"] == 1)).any())
+        self.assertTrue((corrupted.loc[corrupted["rate:missing"] == 1, "rate"] == 0.75).all())
+        self.assertTrue((corrupted.loc[corrupted["rate_all:missing"] == 1, "rate_all"] == 0.5).all())
+
+    def test_masking_takes_the_implied_flag_along_and_never_creates_impossible_rows(self):
+        for level in (0.3, 0.6, 1.0):
+            for repetition in (0, 1):
+                corrupted, counts = self.bank.corrupt("value_masking", level, repetition)
+                self.check_valid(corrupted)
+                self.assertGreater(counts["reverted"], 0)
+        full, _ = self.bank.corrupt("value_masking", 1.0, 0)
+        reported = self.X_test["reports_rate"] == 1
+        # every row that does not report the rate loses both values; rows that report it keep them
+        self.assertTrue((full.loc[~reported, ["rate:missing", "rate_all:missing"]] == 1).all().all())
+        pandas.testing.assert_frame_equal(full.loc[reported], self.X_test.loc[reported].astype(float))
+
+    def test_a_masked_rate_all_always_masks_the_rate_in_the_same_row(self):
+        clean = self.X_test
+        corrupted, _ = self.bank.corrupt("value_masking", 0.4, 0)
+        newly_all = (corrupted["rate_all:missing"] == 1) & (clean["rate_all:missing"] == 0)
+        self.assertTrue(newly_all.any())
+        self.assertTrue((corrupted.loc[newly_all, "rate:missing"] == 1).all())
+
+    def test_masked_cells_stay_nested_across_levels(self):
+        clean = self.X_test.astype(float)
+        previous = None
+        for level in (0.2, 0.4, 0.6, 0.8, 1.0):
+            changed = (self.bank.corrupt("value_masking", level, 1)[0] != clean).to_numpy()
+            if previous is not None:
+                self.assertFalse((previous & ~changed).any(), level)
+            previous = changed
 
 
 if __name__ == "__main__":
