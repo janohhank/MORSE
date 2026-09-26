@@ -1,23 +1,30 @@
 # MORSE runtime dependencies.
 #
-# Python >= 3.10 is required (the code uses PEP 604 `X | None` unions and
-# PEP 585 builtin generics such as `list[str]`).
-#
-# These are the reference pins the pipeline is developed and validated
-# against: a coherent, mutually compatible scientific-Python stack. numpy is
-# held < 2.0 for compatibility with the pinned deap release. Install with:
+# These are the exact versions of the environment the reported runs were
+# produced with (Python 3.14.7; taken from `python -m pip freeze` on
+# 2026-09-21): a coherent, mutually compatible scientific-Python stack.
+# Install with:
 #
 #     python -m pip install -r requirements.txt
 #
+# Python: the pinned numpy 2.5 and scipy 1.18 need Python >= 3.12 (pandas 3.0,
+# scikit-learn 1.9 and matplotlib 3.11 need >= 3.11). The code itself only uses
+# Python 3.10+ syntax (PEP 604 `X | None` unions, PEP 585 builtin generics such
+# as `list[str]`), so an older interpreter needs older pins (see the git
+# history of this file for the previous reference set).
+#
 # Only these eight third-party packages are imported anywhere in the code
 # base (statsmodels is intentionally NOT a dependency: the VIF analysis that
-# once required it is no longer part of the pipeline).
+# once required it is no longer part of the pipeline). deap additionally
+# installs its own dependency, moocore, which is pinned as well so that the
+# environment is fully reproducible.
 
-numpy==1.26.4
-pandas==2.2.2
-scipy==1.13.1
-scikit-learn==1.5.1
-matplotlib==3.9.2
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+scikit-learn==1.9.0
+matplotlib==3.11.1
 seaborn==0.13.2
-deap==1.4.1
-joblib==1.4.2
+deap==1.4.4
+joblib==1.5.3
+moocore==0.3.2

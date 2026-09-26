@@ -12,6 +12,18 @@ def ensure_directory(directory: str) -> None:
     os.makedirs(directory, exist_ok=True)
 
 
+def repository_root() -> str:
+    """The directory that holds the pipeline modules, i.e. the repository root.
+
+    The notebook writes every result folder here, whatever working directory the
+    kernel was started in. A relative result path silently ends up wherever the
+    notebook happens to be opened from -- for example inside an earlier result
+    folder that holds an archived copy of the notebook, which is exactly how runs
+    ended up nested inside `2026-09-21_10-05-37/`.
+    """
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def save_stats_csv(stats: list[dict], filepath: str) -> None:
     """Persist a list of homogeneous dict rows as a CSV file. Used by the
     single- and multi-objective GA training classes to save per-generation
