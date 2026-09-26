@@ -8,6 +8,7 @@ here. Every plotting function applies the shared theme via
 from __future__ import annotations
 
 import os
+import textwrap
 from typing import Sequence
 
 import numpy
@@ -15,6 +16,8 @@ import pandas
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import seaborn as sns
 
 from training_utils import (
@@ -190,116 +193,312 @@ def plot_pareto_front(pareto_individuals: list, filepath: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# All-models noise-robustness plots
+# Robustness suite (robustness_evaluation.py)
 # ---------------------------------------------------------------------------
 
-def plot_noise_comparison(agg_df: pandas.DataFrame,
-                          model_styles: dict[str, tuple[str, str, str, str]],
-                          xlabel: str,
-                          ylabel: str,
-                          title: str,
-                          out_path: str) -> None:
-    """Line plot of mean AUC vs. a 1D noise level for multiple models with
-    shaded +/- 1 std bands.
+def _method_handles(method_styles: dict[str, tuple[str, str, str, str]]) -> list[Line2D]:
+    """Legend entries for the methods: key -> (display name, colour, marker, line style)."""
+    return [Line2D([0], [0], color=colour, marker=marker, linestyle=linestyle, linewidth=2, label=label)
+            for label, colour, marker, linestyle in method_styles.values()]
+
+
+def _panel_grid(n_panels: int, max_columns: int, panel_width: float, panel_height: float):
+    n_columns: int = max(1, min(n_panels, max_columns))
+    n_rows: int = int(numpy.ceil(n_panels / n_columns)) if n_panels else 1
+    fig, axes = plt.subplots(n_rows, n_columns, figsize=(panel_width * n_columns, panel_height * n_rows),
+                             squeeze=False)
+    for ax in list(axes.flat)[n_panels:]:
+        ax.set_visible(False)
+    return fig, axes
+
+
+def plot_population_shift_curves(curves: pandas.DataFrame,
+                                 panels: Sequence[tuple[str, str, str]],
+                                 ess_levels: Sequence[float],
+                                 method_styles: dict[str, tuple[str, str, str, str]],
+                                 out_path: str,
+                                 title: str) -> None:
+    """Test ROC-AUC of every method along each population-shift axis, one panel per axis.
 
     Parameters
     ----------
-    agg_df
-        Multi-index-column DataFrame produced by
-        `.groupby(level_col).agg(["mean", "std"])`. Expected to have
-        `(f"auc_{key}", "mean")` and `(f"auc_{key}", "std")` columns for
-        every `key` in `model_styles`.
-    model_styles
-        Dict mapping model key -> (display name, colour, marker, linestyle).
+    curves
+        Columns `axis`, `position`, `method`, `mean`, `sd`. Position 0 is the clean test set; +k / -k is
+        the k-th training-ESS level (1 = the mildest) of a re-weighting towards the positive / negative
+        end of the axis. `sd` (the SD across runs) is drawn as a band where it exists.
+    panels
+        (axis, what the negative end emphasises, what the positive end emphasises), in panel order.
+    ess_levels
+        The training-ESS levels, mildest first (tick labels).
+    method_styles
+        Method key -> (display name, colour, marker, line style).
     """
+    ensure_directory(os.path.dirname(out_path))
     _apply_plot_theme()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for key, (name, colour, marker, ls) in model_styles.items():
-        mean_series: pandas.Series = agg_df[(f"auc_{key}", "mean")]
-        std_series:  pandas.Series = agg_df[(f"auc_{key}", "std")].fillna(0.0)
-        x_vals: numpy.ndarray = mean_series.index.values
-        m_vals: numpy.ndarray = mean_series.values
-        s_vals: numpy.ndarray = std_series.values
-        ax.plot(x_vals, m_vals, label=name,
-                color=colour, marker=marker, linestyle=ls, linewidth=2)
-        ax.fill_between(x_vals, m_vals - s_vals, m_vals + s_vals,
-                        color=colour, alpha=0.15)
-    ax.set_xlabel(xlabel, fontweight="bold")
-    ax.set_ylabel(ylabel, fontweight="bold")
-    ax.set_title(title, fontweight="bold", pad=10)
-    ax.legend(frameon=True, fancybox=True, shadow=True)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    fig, axes = _panel_grid(len(panels), 2, 7.2, 4.6)
+    k: int = len(ess_levels)
+    labels: list[str] = ([f"{level:.0%}" for level in reversed(ess_levels)] + ["clean"]
+                         + [f"{level:.0%}" for level in ess_levels])
+    for ax, (axis_name, negative, positive) in zip(axes.flat, panels):
+        part: pandas.DataFrame = curves[curves["axis"] == axis_name]
+        for method, (label, colour, marker, linestyle) in method_styles.items():
+            line: pandas.DataFrame = part[part["method"] == method].sort_values("position")
+            if line.empty:
+                continue
+            ax.plot(line["position"], line["mean"], color=colour, marker=marker, linestyle=linestyle,
+                    linewidth=2, label=label)
+            if line["sd"].notna().any():
+                sd: pandas.Series = line["sd"].fillna(0.0)
+                ax.fill_between(line["position"], line["mean"] - sd, line["mean"] + sd, color=colour, alpha=0.15)
+        ax.set_xticks(numpy.arange(-k, k + 1))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_xlim(-k - 0.3, k + 0.3)
+        ax.set_title(axis_name, fontweight="bold")
+        ax.set_xlabel(f"← {negative}        training ESS of the re-weighting        {positive} →",
+                      fontsize=9)
+        ax.set_ylabel("Test ROC-AUC", fontweight="bold")
+        ax.grid(True, alpha=0.3)
+    fig.legend(handles=_method_handles(method_styles), loc="lower center", ncol=len(method_styles), frameon=True)
+    fig.suptitle(title, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
-def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
-                         model_styles: dict[str, tuple[str, str, str, str]],
-                         cbar_label: str,
-                         xlabel: str,
-                         ylabel: str,
-                         title: str,
-                         out_path: str,
-                         aurs_scores: dict[str, float] | None = None) -> None:
-    """Render a 2x2 grid of heatmaps -- one panel per model -- sharing the
-    same vmin/vmax so the panels are directly visually comparable.
+def plot_dependence_shift_summary(curves: pandas.DataFrame,
+                                  differences: pandas.DataFrame,
+                                  ess_levels: Sequence[float],
+                                  method_styles: dict[str, tuple[str, str, str, str]],
+                                  out_path: str,
+                                  title: str) -> None:
+    """Dependence shifts in three panels. Left and middle: the change of test ROC-AUC, averaged over the
+    pairs given in `curves`, when the pairs are decorrelated / strengthened, against the training ESS of the
+    re-weighting (mean over runs; band = SD across runs). Right: for every pair, MORSE's change minus the
+    SO-GA's change (each averaged over the runs) -- above zero, MORSE lost less on that pair; the share
+    of pairs above zero is printed over each box.
 
     Parameters
     ----------
-    heatmap_agg
-        A pandas DataFrame with a two-level MultiIndex whose LEVELS are
-        (noise_level, mean_shift) and whose columns include one
-        `auc_{key}` for every `key` in `model_styles`.
-    model_styles
-        Same shape as in `plot_noise_comparison`; only the display name
-        (index 0) is used for the panel title -- colour/marker/linestyle
-        are irrelevant for the heatmap and get ignored.
-    aurs_scores
-        Optional dict mapping each `model_styles` key to its AURS score
-        (see `evaluation_utils.compute_aurs`) -- the fraction of that
-        model's own clean-test score retained on average across this whole
-        grid. When given, each panel's title gets a second line showing it
-        as a percentage. `None` (the default) omits the subtitle.
+    curves
+        Columns `direction` ("decorrelate" / "strengthen"), `ess_level`, `method`, `mean`, `sd`.
+    differences
+        Columns `direction`, `ess_level`, `scenario`, `difference` (may be empty).
     """
+    ensure_directory(os.path.dirname(out_path))
     _apply_plot_theme()
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.4))
+    rank: dict[float, int] = {level: i + 1 for i, level in enumerate(ess_levels)}
+    tick_labels: list[str] = ["clean"] + [f"{level:.0%}" for level in ess_levels]
+    for ax, direction in zip(axes[:2], ("decorrelate", "strengthen")):
+        part: pandas.DataFrame = curves[curves["direction"] == direction]
+        if part.empty:
+            ax.text(0.5, 0.5, "too few pairs are usable\nat every level", transform=ax.transAxes,
+                    ha="center", va="center", color="gray")
+        for method, (label, colour, marker, linestyle) in method_styles.items():
+            line: pandas.DataFrame = part[part["method"] == method]
+            if line.empty:
+                continue
+            x: numpy.ndarray = numpy.r_[0, line["ess_level"].map(rank).to_numpy(dtype=float)]
+            order: numpy.ndarray = numpy.argsort(x)
+            mean: numpy.ndarray = numpy.r_[0.0, line["mean"].to_numpy(dtype=float)][order]
+            sd: numpy.ndarray = numpy.r_[0.0, line["sd"].fillna(0.0).to_numpy(dtype=float)][order]
+            ax.plot(x[order], mean, color=colour, marker=marker, linestyle=linestyle, linewidth=2, label=label)
+            if line["sd"].notna().any():
+                ax.fill_between(x[order], mean - sd, mean + sd, color=colour, alpha=0.15)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_xticks(numpy.arange(len(tick_labels)))
+        ax.set_xticklabels(tick_labels)
+        ax.set_title({"decorrelate": "Pairs decorrelated", "strengthen": "Pairs strengthened"}[direction],
+                     fontweight="bold")
+        ax.set_xlabel("Training ESS of the re-weighting", fontweight="bold")
+        ax.set_ylabel("Change of test ROC-AUC\n(mean over the pairs)", fontweight="bold")
+        ax.grid(True, alpha=0.3)
 
-    def _pivot(model_key: str) -> pandas.DataFrame:
-        col_name: str = f"auc_{model_key}"
-        m: pandas.DataFrame = heatmap_agg[[col_name]].reset_index()
-        pivot: pandas.DataFrame = m.pivot(
-            index="mean_shift", columns="noise_level", values=col_name)
-        # Order rows so the most-positive shift is on top.
-        return pivot.sort_index(ascending=False)
+    ax = axes[2]
+    box_colours: dict[str, str] = {"decorrelate": "#6baed6", "strengthen": "#fd8d3c"}
+    drawn: list[str] = []
+    if not differences.empty:
+        for direction, offset in (("decorrelate", -0.18), ("strengthen", 0.18)):
+            for level in ess_levels:
+                values: numpy.ndarray = differences.loc[
+                    (differences["direction"] == direction) & numpy.isclose(differences["ess_level"], level),
+                    "difference"].dropna().to_numpy(dtype=float)
+                if values.size == 0:
+                    continue
+                position: float = rank[level] + offset
+                if direction not in drawn:
+                    drawn.append(direction)
+                boxes = ax.boxplot([values], positions=[position], widths=0.3, patch_artist=True,
+                                   showfliers=True, flierprops={"markersize": 3})
+                for patch in boxes["boxes"]:
+                    patch.set_facecolor(box_colours[direction])
+                    patch.set_alpha(0.8)
+                ax.annotate(f"{(values > 0).mean():.0%}", xy=(position, float(numpy.max(values))),
+                            xytext=(0, 4), textcoords="offset points", ha="center", fontsize=8)
+        box_labels: dict[str, str] = {"decorrelate": "pairs decorrelated", "strengthen": "pairs strengthened"}
+        if drawn:
+            ax.legend(handles=[Patch(facecolor=box_colours[d], label=box_labels[d]) for d in drawn],
+                      loc="best", fontsize=8)
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_xticks(numpy.arange(1, len(ess_levels) + 1))
+    ax.set_xticklabels([f"{level:.0%}" for level in ess_levels])
+    ax.set_xlim(0.4, len(ess_levels) + 0.6)
+    ax.set_title("MORSE minus SO-GA, per pair", fontweight="bold")
+    ax.set_xlabel("Training ESS of the re-weighting", fontweight="bold")
+    ax.set_ylabel("Difference of the change of ROC-AUC\n(> 0: MORSE loses less)", fontweight="bold")
+    ax.grid(True, alpha=0.3)
 
-    pivots: dict[str, pandas.DataFrame] = {
-        key: _pivot(key) for key in model_styles.keys()
-    }
-    shared_vmin: float = min(float(p.values.min()) for p in pivots.values())
-    shared_vmax: float = max(float(p.values.max()) for p in pivots.values())
+    fig.legend(handles=_method_handles(method_styles), loc="lower center", ncol=len(method_styles), frameon=True)
+    fig.suptitle(title, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.08, 1, 0.93))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-    for ax, (key, pivot) in zip(axes.flat, pivots.items()):
-        display_name: str = model_styles[key][0]
-        sns.heatmap(
-            pivot,
-            ax=ax,
-            cmap="viridis",
-            vmin=shared_vmin, vmax=shared_vmax,
-            cbar_kws={"label": cbar_label},
-            annot=False,
-            square=False,
-        )
-        panel_title: str = display_name
-        if aurs_scores is not None:
-            panel_title += f"\nAURS = {aurs_scores[key]:.1%}"
-        ax.set_title(panel_title, fontweight="bold", pad=8)
+
+def plot_corruption_curves(curves: pandas.DataFrame,
+                           families: Sequence[tuple[str, str, str]],
+                           method_styles: dict[str, tuple[str, str, str, str]],
+                           out_path: str,
+                           title: str) -> None:
+    """Test ROC-AUC of every method against the corruption level, one panel per corruption family.
+
+    Parameters
+    ----------
+    curves
+        Columns `family`, `level` (0 = the clean test set), `method`, `mean`, `sd`: the ROC-AUC averaged
+        over the corruption bank, then over the runs; `sd` is the SD across runs (drawn as a band).
+    families
+        (family, panel title, x-axis label), in panel order.
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+    fig, axes = _panel_grid(len(families), 2, 7.2, 4.6)
+    for ax, (family, panel_title, xlabel) in zip(axes.flat, families):
+        part: pandas.DataFrame = curves[curves["family"] == family]
+        for method, (label, colour, marker, linestyle) in method_styles.items():
+            line: pandas.DataFrame = part[part["method"] == method].sort_values("level")
+            if line.empty:
+                continue
+            ax.plot(line["level"], line["mean"], color=colour, marker=marker, linestyle=linestyle,
+                    linewidth=2, label=label)
+            if line["sd"].notna().any():
+                sd: pandas.Series = line["sd"].fillna(0.0)
+                ax.fill_between(line["level"], line["mean"] - sd, line["mean"] + sd, color=colour, alpha=0.15)
+        ax.set_title(panel_title, fontweight="bold")
         ax.set_xlabel(xlabel, fontweight="bold")
-        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.set_ylabel("Test ROC-AUC", fontweight="bold")
+        ax.grid(True, alpha=0.3)
+    fig.legend(handles=_method_handles(method_styles), loc="lower center", ncol=len(method_styles), frameon=True)
+    fig.suptitle(title, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
-    fig.suptitle(title, fontweight="bold", fontsize=13, y=1.00)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+
+def plot_robustness_overview(overview: pandas.DataFrame,
+                             family_labels: dict[str, str],
+                             method_styles: dict[str, tuple[str, str, str, str]],
+                             out_path: str,
+                             title: str) -> None:
+    """Clean vs stressed test ROC-AUC of every method, per stress family (x-axis; the tick label names
+    the statistic, e.g. the worst scenario or the mean over the corruption bank). A second panel with
+    the worst usable scenario is added when `worst_mean` is given. Hollow marker = clean, filled marker
+    = stressed; error bars = SD across runs.
+
+    Parameters
+    ----------
+    overview
+        Columns `family`, `method`, `clean_mean`, `clean_sd`, `stressed_mean`, `stressed_sd`,
+        `worst_mean`, `worst_sd` (NaN where not applicable).
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+    families: list[str] = list(dict.fromkeys(overview["family"]))
+    worst_families: list[str] = [f for f in families
+                                 if overview.loc[overview["family"] == f, "worst_mean"].notna().any()]
+    panels: list[tuple[list[str], str, str, str]] = [
+        (families, "stressed_mean", "stressed_sd", "Stressed = the statistic named under each family")]
+    if worst_families:
+        panels.append((worst_families, "worst_mean", "worst_sd", "Worst usable scenario (re-weighting)"))
+    widths: list[float] = [max(4.0, 1.3 * len(p[0]) + 1.5) for p in panels]
+    fig, axes = plt.subplots(1, len(panels), figsize=(sum(widths), 5.6), squeeze=False,
+                             gridspec_kw={"width_ratios": widths})
+    methods: list[str] = [m for m in method_styles if m in set(overview["method"])]
+    step: float = 0.8 / max(len(methods), 1)
+    for ax, (panel_families, column, sd_column, subtitle) in zip(axes.flat, panels):
+        for j, method in enumerate(methods):
+            label, colour, marker, _ = method_styles[method]
+            for i, family in enumerate(panel_families):
+                row: pandas.DataFrame = overview[(overview["family"] == family) & (overview["method"] == method)]
+                if row.empty or numpy.isnan(row[column].iloc[0]):
+                    continue
+                x: float = i - 0.4 + step * (j + 0.5)
+                clean_value: float = float(row["clean_mean"].iloc[0])
+                stressed_value: float = float(row[column].iloc[0])
+                ax.plot([x, x], [clean_value, stressed_value], color=colour, linewidth=1.5)
+                ax.errorbar(x, clean_value, yerr=numpy.nan_to_num(row["clean_sd"].iloc[0]), fmt=marker,
+                            markerfacecolor="white", markeredgecolor=colour, ecolor=colour, markersize=7, capsize=2)
+                ax.errorbar(x, stressed_value, yerr=numpy.nan_to_num(row[sd_column].iloc[0]), fmt=marker,
+                            color=colour, markersize=7, capsize=2)
+        ax.set_xticks(numpy.arange(len(panel_families)))
+        ax.set_xticklabels([textwrap.fill(family_labels.get(f, f), 16) for f in panel_families], fontsize=8)
+        ax.set_ylabel("Test ROC-AUC", fontweight="bold")
+        ax.set_title(subtitle, fontweight="bold")
+        ax.grid(True, axis="y", alpha=0.3)
+    fig.legend(handles=_method_handles({m: method_styles[m] for m in methods}), loc="lower center",
+               ncol=len(methods), frameon=True)
+    fig.suptitle(title, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.07, 1, 0.93))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_sign_vs_degradation(points: pandas.DataFrame,
+                             correlations: pandas.DataFrame,
+                             family_labels: dict[str, str],
+                             method_styles: dict[str, tuple[str, str, str, str]],
+                             out_path: str,
+                             title: str) -> None:
+    """Sign consistency S of every GA model against its change of test ROC-AUC, one panel per stress
+    family; the marker size grows with the number of inputs K. The Spearman correlation and the partial
+    one given K are printed in every panel. Exploratory: a correlation does not show that S causes the
+    difference.
+
+    Parameters
+    ----------
+    points
+        Columns `family`, `method`, `seed`, `sign_consistency`, `n_features`, `delta_roc_auc`.
+    correlations
+        Columns `family`, `n_models`, `spearman`, `partial_spearman_given_size`.
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+    families: list[str] = list(dict.fromkeys(points["family"]))
+    fig, axes = _panel_grid(len(families), 4, 4.6, 4.2)
+    scale: float = 160.0 / max(float(points["n_features"].max()), 1.0)
+    for ax, family in zip(axes.flat, families):
+        part: pandas.DataFrame = points[points["family"] == family]
+        for method, (label, colour, marker, _) in method_styles.items():
+            sub: pandas.DataFrame = part[part["method"] == method]
+            ax.scatter(sub["sign_consistency"], sub["delta_roc_auc"], s=15 + scale * sub["n_features"],
+                       c=colour, marker=marker, alpha=0.7, edgecolors="black", linewidths=0.4, label=label)
+        row: pandas.DataFrame = correlations[correlations["family"] == family]
+        if not row.empty:
+            ax.text(0.02, 0.02, f"Spearman {row['spearman'].iloc[0]:+.2f}\n"
+                                f"given K {row['partial_spearman_given_size'].iloc[0]:+.2f}",
+                    transform=ax.transAxes, fontsize=8, va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.8))
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_title(textwrap.fill(family_labels.get(family, family), 30), fontsize=10, fontweight="bold")
+        ax.set_xlabel("Sign consistency S")
+        ax.set_ylabel("Change of test ROC-AUC")
+        ax.grid(True, alpha=0.3)
+    handles: list[Line2D] = [Line2D([0], [0], color=colour, marker=marker, linestyle="", markersize=8, label=label)
+                             for label, colour, marker, _ in method_styles.values()]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=True)
+    fig.suptitle(title, fontweight="bold")
+    fig.tight_layout(rect=(0, 0.07, 1, 0.93))
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
