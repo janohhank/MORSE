@@ -200,6 +200,11 @@ class RunDiscoveryTests(unittest.TestCase):
             self.assertEqual(ood.run_selection_rule(directory), "knee")
             write_notebook(directory, "N = 1")
             self.assertIsNone(ood.run_selection_rule(directory))
+            # the run manifest comes first
+            atomic_write_json(os.path.join(directory, "run_manifest.json"), {"settings": {"pareto_rule": "max_s"}})
+            self.assertEqual(ood.run_selection_rule(directory), "max_s")
+            atomic_write_json(os.path.join(directory, "run_manifest.json"), {"settings": {}})
+            self.assertIsNone(ood.run_selection_rule(directory))
 
     def test_display_path(self):
         inside = os.path.join(ood.REPOSITORY_ROOT, "college_scorecard", "x.csv")

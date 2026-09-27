@@ -89,6 +89,7 @@ from checkpoint_utils import (FINGERPRINT_FILE, SeedTrainingResult, TrainingChec
 from evaluation_utils import (build_model_package, compute_marginal_correlations,  # noqa: E402
                               compute_model_sign_consistency, predict_scores)
 from multi_objective_training import MultiObjectiveTraining  # noqa: E402
+from run_manifest import read_run_manifest  # noqa: E402
 from training_config import TrainingConfig  # noqa: E402
 from training_utils import (best_auc_index, best_sign_consistency_index, ensure_directory,  # noqa: E402
                             knee_point_index)
@@ -188,8 +189,12 @@ def find_matching_runs(current: dict[str, Any]) -> list[str]:
 
 
 def run_selection_rule(run_directory: str) -> str | None:
-    """The front-selection rule of a run -- "knee" or "max_s" -- read from USE_KNEE_POINT_SELECTION in
-    the copy of training_notebook.ipynb archived in the run folder; None if it cannot be read."""
+    """The front-selection rule of a run -- "knee" or "max_s" -- from the run manifest (run_manifest.py),
+    or else from USE_KNEE_POINT_SELECTION in the copy of training_notebook.ipynb archived in the run
+    folder; None if neither can be read."""
+    manifest: dict[str, Any] | None = read_run_manifest(run_directory)
+    if manifest is not None and manifest.get("settings", {}).get("pareto_rule") in ("knee", "max_s"):
+        return manifest["settings"]["pareto_rule"]
     path: str = os.path.join(run_directory, "training_notebook.ipynb")
     if not os.path.isfile(path):
         return None

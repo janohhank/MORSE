@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from unittest import mock
 
 import numpy
@@ -30,6 +31,7 @@ sys.path.insert(0, HERE)
 from deap import creator  # noqa: E402
 
 import robustness_evaluation as evaluation  # noqa: E402
+import run_manifest  # noqa: E402
 from checkpoint_utils import (SeedTrainingResult, TrainingCheckpointStore, atomic_write_json,  # noqa: E402
                               build_training_fingerprint)
 from deap_types import ensure_multi_objective_types, ensure_single_objective_types  # noqa: E402
@@ -190,7 +192,7 @@ class StandAloneTests(unittest.TestCase):
 
     def test_a_run_folder_without_a_usable_notebook_is_refused(self):
         with tempfile.TemporaryDirectory() as empty:
-            with self.assertRaisesRegex(FileNotFoundError, "no archived copy"):
+            with self.assertRaisesRegex(FileNotFoundError, "nor an archived copy"):
                 load_archived_run(empty)
             cells = [{"cell_type": "code", "metadata": {}, "outputs": [], "execution_count": None,
                       "source": ["X_test = None\n"]}]
@@ -325,6 +327,24 @@ class CommandLineTests(unittest.TestCase):
         self.run_main("--seeds", "1", "--selection", "knee")
         self.assertTrue(os.path.isfile(os.path.join(self.run_directory, "evaluation", "robustness_knee", "report.txt")))
 
+    def test_a_run_with_a_manifest_needs_no_notebook(self):
+        other = os.path.join(self.temporary.name, "run_with_manifest")
+        os.makedirs(other)
+        write_run_folder(other)
+        data = load_archived_run(other)
+        run_manifest.write_run_manifest(other, run_manifest.build_run_manifest(
+            [[os.path.join(other, "train.csv")]], os.path.join(other, "test.csv"), "label", data["X_train"],
+            data["y_train"], data["X_test"], data["y_test"], use_roc_auc=False, use_knee_point=True),
+            log=lambda line: None)
+        os.remove(os.path.join(other, "training_notebook.ipynb"))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            run = evaluation.load_run_models(other, seeds=[1])
+        self.assertIn("data from its run manifest", printed.getvalue())
+        self.assertEqual((run.source, run.own_rule, run.use_roc_auc), ("run manifest", "knee", False))
+        self.assertEqual(run.packages[1]["multi"]["features"], self.info["features"][:8])   # the knee point
+        self.assertTrue(os.path.isfile(os.path.join(other, "evaluation", "final_models_knee.json")))
+
     def test_a_notebook_copy_can_stand_in_for_a_missing_archived_one(self):
         other = os.path.join(self.temporary.name, "run_without_notebook")
         os.makedirs(other)
@@ -418,18 +438,30 @@ class HelperTests(unittest.TestCase):
                          [0.6, 1.0, 0.5, 0.5])
 
     def test_provenance(self):
-        with mock.patch.object(evaluation.subprocess, "run", side_effect=OSError("no git")):
-            self.assertEqual(evaluation._git_state(), {"commit": "unknown", "uncommitted_changes": None})
-        with mock.patch.object(evaluation.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 10)):
-            self.assertEqual(evaluation._git_state()["commit"], "unknown")
+        with mock.patch.object(run_manifest.subprocess, "run", side_effect=OSError("no git")):
+            self.assertEqual(run_manifest.git_state(), {"commit": "unknown", "uncommitted_changes": None})
+        with mock.patch.object(run_manifest.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 10)):
+            self.assertEqual(run_manifest.git_state()["commit"], "unknown")
         models = pandas.DataFrame({"method": ["multi", "all"], "seed": pandas.array([3, None], dtype="Int64")})
         frame = pandas.DataFrame({"a": [1.0, 2.0]})
+        fingerprints = evaluation.data_fingerprints(frame, [0, 1], frame, [1, 0])
+        started = datetime.now()
         with tempfile.TemporaryDirectory() as run:
-            self.assertIsNone(evaluation._provenance(RobustnessConfig(), run, frame, frame, models)
-                              ["training_fingerprint_sha256"])
+            record = evaluation._provenance(RobustnessConfig(), run, fingerprints, models, None, "running", started)
+            self.assertIsNone(record["training_fingerprint_sha256"])
+            self.assertIsNone(record["run_manifest_sha256"])
+            self.assertIsNone(record["runtime_seconds"])
             atomic_write_json(os.path.join(run, "checkpoints", "training", "fingerprint.json"), {"a": 1})
-            record = evaluation._provenance(RobustnessConfig(), run, frame, frame, models)
+            atomic_write_json(os.path.join(run, run_manifest.MANIFEST_FILE), {"b": 2})
+            record = evaluation._provenance(RobustnessConfig(), run, fingerprints, models, "knee", "complete",
+                                            started, 12.34)
         self.assertEqual(len(record["training_fingerprint_sha256"]), 64)
+        self.assertEqual(len(record["run_manifest_sha256"]), 64)
+        self.assertEqual((record["status"], record["selection_rule"], record["runtime_seconds"]),
+                         ("complete", "knee", 12.3))
+        self.assertEqual((record["data"]["train_rows"], record["data"]["test_rows"], record["data"]["inputs"]),
+                         (2, 2, 1))
+        self.assertEqual(record["data"]["fingerprints"]["y_test"]["shape"], [2])
         self.assertEqual((record["seeds"], record["models"]["multi"], record["models"]["all"]), ([3], 1, 1))
         self.assertIn("robustness_utils.py", record["source_sha256"])
 
@@ -459,6 +491,95 @@ class ModelInstanceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as out:
                 with self.assertRaisesRegex(RuntimeError, "do not reproduce"):
                     run_robustness_suite(self.X, self.y, self.X, self.y, self.packages, out, log=lambda line: None)
+
+
+class ReproducibilityTests(unittest.TestCase):
+    """Review point 9: the fitted models are recorded and checked, an evaluation never overwrites one of
+    other data or of another rule, and every stage is saved as soon as it is done."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.X, self.y = make_data(300, seed=95)
+        self.X_test, self.y_test = make_data(150, seed=96)
+        features = list(self.X.columns)
+        self.packages = {seed: {m: build_model_package([1] * len(features), features, self.X, pandas.Series(self.y),
+                                                       seed=seed) for m in ("multi", "single")} for seed in (1, 2)}
+        self.config = RobustnessConfig(ess_levels=(0.8,), headline_ess=0.8, corruption_levels=(0.5,),
+                                       headline_corruption_level=0.5, corruption_repetitions=1, max_pairs=2)
+
+    def run_suite(self, out, X_test=None, rule="knee", log=lambda line: None):
+        return run_robustness_suite(self.X, self.y, self.X_test if X_test is None else X_test, self.y_test,
+                                    self.packages, out, config=self.config, log=log, selection_rule=rule)
+
+    def test_the_final_models_are_recorded_and_checked(self):
+        path = os.path.join(self.temporary.name, "final_models_knee.json")
+        first = evaluation.record_final_models(self.packages, path)
+        self.assertEqual(evaluation.record_final_models(self.packages, path), first)      # the same refit
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)
+        self.assertEqual(set(stored["models"]), {"multi/1", "single/1", "multi/2", "single/2"})
+        stored["models"]["multi/1"]["coef"][0] += 1e-3
+        atomic_write_json(path, stored)
+        with self.assertRaisesRegex(RuntimeError, "multi/1: parameters differ"):
+            evaluation.record_final_models(self.packages, path)
+        stored["models"]["multi/1"]["features"] = ["x1"]
+        atomic_write_json(path, stored)
+        with self.assertRaisesRegex(RuntimeError, "other inputs"):
+            evaluation.record_final_models(self.packages, path)
+        # a seed evaluated for the first time is added to the record
+        fresh = os.path.join(self.temporary.name, "fresh.json")
+        evaluation.record_final_models({1: self.packages[1]}, fresh)
+        evaluation.record_final_models(self.packages, fresh)
+        with open(fresh, encoding="utf-8") as handle:
+            self.assertEqual(len(json.load(handle)["models"]), 4)
+
+    def test_build_final_models_writes_the_record_of_its_rule(self):
+        ensure_multi_objective_types()
+        ensure_single_objective_types()
+        features = list(self.X.columns)
+        n = len(features)
+        individual = creator.Individual([1] * n)
+        individual.fitness.values = (0.9, 0.9)
+        single = creator.IndividualSingle([1] * n)
+        single.fitness.values = (0.9,)
+        folder = os.path.join(self.temporary.name, "evaluation")
+        build_final_models(features, self.X, pandas.Series(self.y), [5], {5: [individual]}, {5: single},
+                           {5: [1] * n}, {5: [1] * n}, use_knee_point=False, record_directory=folder)
+        self.assertTrue(os.path.isfile(os.path.join(folder, "final_models_max_s.json")))
+
+    def test_an_evaluation_of_other_data_or_another_rule_is_not_overwritten(self):
+        out = os.path.join(self.temporary.name, "out")
+        self.run_suite(out)
+        self.run_suite(out)                                                              # the same: fine
+        with self.assertRaisesRegex(FileExistsError, "other data"):
+            self.run_suite(out, X_test=self.X_test.assign(x1=self.X_test["x1"] + 1.0))
+        with self.assertRaisesRegex(FileExistsError, "the Pareto rule 'knee'"):
+            self.run_suite(out, rule="max_s")
+        # an evaluation made before the data were recorded is replaced, with a note
+        with open(os.path.join(out, "config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        del config["data"]["fingerprints"], config["selection_rule"]
+        atomic_write_json(os.path.join(out, "config.json"), config)
+        notes = []
+        self.run_suite(out, rule="max_s", log=notes.append)
+        self.assertTrue(any("made before the data were recorded" in note for note in notes))
+        with open(os.path.join(out, "config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        self.assertEqual((config["status"], config["selection_rule"]), ("complete", "max_s"))
+        self.assertGreater(config["runtime_seconds"], 0)
+
+    def test_every_stage_is_saved_when_it_is_done(self):
+        out = os.path.join(self.temporary.name, "interrupted")
+        with mock.patch.object(evaluation, "_corruption", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_suite(out)
+        written = set(os.listdir(out))
+        self.assertTrue({"config.json", "models.csv", "schema.json", "scenarios.csv", "reweighting_scores.csv"}
+                        <= written)
+        self.assertFalse({"corruption_scores.csv", "summary.csv", "report.txt"} & written)
+        with open(os.path.join(out, "config.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["status"], "running")
 
 
 class CleanViolationTests(unittest.TestCase):

@@ -608,6 +608,29 @@ class AvailabilityPairingTests(unittest.TestCase):
         self.assertEqual([(i.flag, i.fills) for i in schema.value_indicators], [("rate:missing", {"rate": 0.7})])
         self.assertEqual(schema.unresolved_availability, [])                    # rate_all was never proposed
 
+    def test_generic_names_propose_nothing(self):
+        # like Arrhythmia's feature_1 ... feature_278: the stem "feature" says nothing about availability,
+        # and feature_1 = 1 on a few rows where feature_3 happens to be constant is no pairing
+        rng = numpy.random.default_rng(26)
+        rare = numpy.zeros(300, dtype=int)
+        rare[:12] = 1
+        frame = pandas.DataFrame({"feature_1": rare, "feature_2": (rng.random(300) < 0.5).astype(int),
+                                  "feature_3": numpy.where(rare == 1, 0.0, rng.normal(size=300)),
+                                  "feature_4": rng.normal(size=300)})
+        schema = infer_feature_schema(frame)
+        self.assertFalse(any(indicator.named for indicator in schema.value_indicators))
+        self.assertEqual(schema.unresolved_availability, [])
+
+    def test_a_value_the_names_pair_with_two_flags_is_reported(self):
+        rng = numpy.random.default_rng(27)
+        missing = rng.random(500) < 0.3
+        frame = pandas.DataFrame({"rate": numpy.where(missing, 0.5, rng.uniform(0, 1, 500)),
+                                  "rate:missing": missing.astype(int), "rate_flag": missing.astype(int)})
+        schema = infer_feature_schema(frame)
+        self.assertFalse(any("rate" in indicator.named for indicator in schema.value_indicators))
+        self.assertEqual(sorted(u.flag for u in schema.unresolved_availability), ["rate:missing", "rate_flag"])
+        self.assertIn("several flags", schema.unresolved_availability[0].reason)
+
     def test_a_pair_the_data_do_not_confirm_is_reported(self):
         rng = numpy.random.default_rng(24)
         frame = pandas.DataFrame({"x": rng.normal(size=500), "x:missing": (rng.random(500) < 0.2).astype(int)})

@@ -102,6 +102,7 @@ seed varies — this is a deliberate design choice.
 ├── docs/robustness.md               # The robustness suite in detail
 ├── checkpoint_utils.py              # Per-seed training checkpoints (Pareto fronts, masks)
 │                                    #   and resuming a run
+├── run_manifest.py                  # run_manifest.json: what a run was trained on; rebuilding its data
 ├── deap_types.py                    # The DEAP fitness / individual classes (one definition)
 ├── requirements.txt                 # Pinned dependency set
 ├── tests/                           # Unit tests: python -m unittest discover -s tests -v
@@ -142,6 +143,7 @@ data through its official access pathway and add a matching config block.
 | `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
 | `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
 | `legacy_stress_evaluation` | `run_legacy_stress_grid`: the robustness evaluation of runs made before the suite (Gaussian noise × PC1 covariate-shift grid, 0/1 re-draw noise, AURS), unchanged — it reproduces those runs' CSVs byte for byte — as an optional notebook block and as `python legacy_stress_evaluation.py --run <result folder>`. |
+| `run_manifest` | `run_manifest.json`, written when a run starts (data files and hashes, input order, objective, Pareto rule, settings), and `load_run_data`, which rebuilds a finished run's data from it — or from a notebook copy for older runs — plus `verify_training_data` against the checkpoint fingerprint. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
 | `deap_types` | The DEAP fitness / individual classes (`FitnessMulti` / `Individual`, `FitnessSingle` / `IndividualSingle`), defined once for the trainers, the notebook and the checkpoint loader. |
 
@@ -198,10 +200,12 @@ leaks into the training data.
 
 ```
 YYYY-MM-DD_HH-MM-SS/
+├── run_manifest.json                     # data files + hashes, input order, objective, Pareto rule, settings
 ├── multi/seed_<N>/                       # convergence.csv, convergence.png, pareto_front.png
 ├── single/seed_<N>/                      # convergence.csv, convergence.png
 ├── checkpoints/training/                 # fingerprint.json + seed_<N>/ (morse_front.csv, selections.json, complete.json)
 └── evaluation/
+    ├── final_models_<rule>.json          # the fitted final models (coefficients, scalers) of the Pareto rule
     ├── robustness/                       # robustness suite: report, CSV tables, tests, five figures
     ├── all_models_comparison/            # legacy stress grid (optional block): per-seed CSVs, AURS, four figures
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
@@ -232,8 +236,19 @@ Everything is plain CSV/JSON, written atomically: the files are readable,
 usable for the paper (fronts, masks) and independent of library versions.
 `fingerprint.json` records the training configuration, the cross-validation
 settings, the feature names and hashes of the training data. The fitted
-logistic-regression packages of the evaluation are deliberately not stored:
-they are rebuilt from the masks in seconds.
+logistic-regression models are rebuilt from the masks in seconds rather than
+pickled; their coefficients and scalers are recorded once in
+`evaluation/final_models_<rule>.json`, and every later re-evaluation must
+reproduce that record (a newer library or code that fits differently stops
+with an explanation).
+
+Before training starts, the notebook also writes **`run_manifest.json`**: the
+CSV files the training and test data were read from (with SHA-256 hashes —
+found by trying the file names of the configuration cells and keeping the list
+that reproduces the data exactly), the target and the input order, fingerprints
+of the training and test arrays, the main objective, MORSE's Pareto rule, the GA
+settings, the CV and the seeds. With it, a finished run can be evaluated again
+without a copy of the notebook. Resuming a run with other data is refused.
 
 To continue after a failure (a crash in the evaluation, an interrupted
 training, a lost kernel): restart the kernel, set
@@ -259,14 +274,21 @@ changed settings or a newer version of the suite — without retraining:
 python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
 ```
 
-The run's data are rebuilt from the configuration and data-loading cells of the
+The run's data are rebuilt from its `run_manifest.json` (the recorded CSV
+files, which must still give the recorded arrays) — or, for runs made before
+the manifest existed, from the configuration and data-loading cells of the
 notebook copy archived in the run folder (or of the copy given with
-`--notebook`), checked against the run's checkpoint fingerprint, and the final
-models are refit from the saved masks. The outputs go to
+`--notebook`) — and checked against the run's checkpoint fingerprint; the final
+models are refit from the saved masks and checked against
+`evaluation/final_models_<rule>.json`. The outputs go to
 `<run>/evaluation/robustness/`; an evaluation with a Pareto rule other than the
-run's own (`--selection knee` / `max_s`) goes to `robustness_<rule>/`, so it
-never overwrites the run's (`--out` for another folder; `--seeds` is described
-by `--help`). See [docs/robustness.md](docs/robustness.md).
+run's own (`--selection knee` / `max_s`) goes to `robustness_<rule>/`, and a
+folder holding an evaluation of other data or of another rule is never
+overwritten (`--out` for another folder; `--seeds` is described by `--help`).
+Every stage's tables are saved as soon as the stage is done, and `config.json`
+records the status, the selection rule, the data fingerprints and the hashes
+of the manifest and the checkpoint fingerprint. See
+[docs/robustness.md](docs/robustness.md).
 
 The legacy stress grid works the same way:
 

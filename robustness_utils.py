@@ -403,7 +403,7 @@ def infer_feature_schema(X_train: pandas.DataFrame, config: RobustnessConfig | N
 
 
 # Characters that separate the parts of a column name (`albumin:Binary`, `ADM_RATE:missing`, `x.flag`).
-NAME_SEPARATORS: str = ":_. "
+NAME_SEPARATORS: str = ":_."
 
 
 def _split_name(name: str) -> tuple[str, str] | None:
@@ -423,6 +423,25 @@ def _named_values(flag: str, continuous: list[str]) -> list[str]:
     return [value for value in continuous if value == split[0] or (value != flag and _split_name(value) == split)]
 
 
+def _name_proposals(binary: list[str], continuous: list[str]) -> dict[str, list[str]]:
+    """value -> the 0/1 inputs whose names propose it as their value. Only a 0/1 input that is the ONLY
+    one with its stem and separator proposes: `albumin:Binary` is, but not `feature_2` among `feature_1`,
+    `feature_2`, ... (generic names, where the stem says nothing), nor a level of a one-hot group."""
+    splits: dict[str, tuple[str, str] | None] = {flag: _split_name(flag) for flag in binary}
+    group_sizes: dict[tuple[str, str], int] = {}
+    for split in splits.values():
+        if split is not None:
+            group_sizes[split] = group_sizes.get(split, 0) + 1
+    proposals: dict[str, list[str]] = {}
+    for flag in binary:
+        split = splits[flag]
+        if split is None or group_sizes[split] > 1:
+            continue
+        for value in _named_values(flag, continuous):
+            proposals.setdefault(value, []).append(flag)
+    return proposals
+
+
 def _find_value_indicators(A: numpy.ndarray, index: dict[str, int], binary: list[str], continuous: list[str],
                            config: RobustnessConfig) -> tuple[list[ValueIndicator], list[UnresolvedAvailability]]:
     if not continuous or not binary:
@@ -432,28 +451,32 @@ def _find_value_indicators(A: numpy.ndarray, index: dict[str, int], binary: list
 
     # 1. pairs proposed by the names, confirmed by the data
     named: set[str] = set()
-    for flag in binary:
+    for value, flags in _name_proposals(binary, continuous).items():
+        if len(flags) > 1:
+            unresolved.extend(UnresolvedAvailability(flag, value, f"the names pair it with several flags: {flags}")
+                              for flag in flags)
+            continue
+        flag: str = flags[0]
         x: numpy.ndarray = A[:, index[flag]]
-        for value in _named_values(flag, continuous):
-            v: numpy.ndarray = A[:, index[value]]
-            # a continuous value has more than two distinct values, so it is constant on at most one level
-            levels: list[int] = [level for level in (0, 1) if numpy.ptp(v[x == level]) == 0]
-            if not levels:
-                unresolved.append(UnresolvedAvailability(
-                    flag, value, "paired by name, but the value is not constant on either level of the flag"))
-                continue
-            level: int = levels[0]
-            indicator: ValueIndicator | None = found.get(flag)
-            if indicator is None:
-                indicator = found[flag] = ValueIndicator(flag=flag, off_level=level, fills={}, named=[])
-            elif indicator.off_level != level:
-                unresolved.append(UnresolvedAvailability(
-                    flag, value, f"paired by name, but constant on flag level {level} while the flag's other "
-                                 f"values are constant on level {indicator.off_level}"))
-                continue
-            indicator.fills[value] = float(v[x == level][0])
-            indicator.named.append(value)
-            named.add(value)
+        v: numpy.ndarray = A[:, index[value]]
+        # a continuous value has more than two distinct values, so it is constant on at most one level
+        levels: list[int] = [level for level in (0, 1) if numpy.ptp(v[x == level]) == 0]
+        if not levels:
+            unresolved.append(UnresolvedAvailability(
+                flag, value, "paired by name, but the value is not constant on either level of the flag"))
+            continue
+        level: int = levels[0]
+        indicator: ValueIndicator | None = found.get(flag)
+        if indicator is None:
+            indicator = found[flag] = ValueIndicator(flag=flag, off_level=level, fills={}, named=[])
+        elif indicator.off_level != level:
+            unresolved.append(UnresolvedAvailability(
+                flag, value, f"paired by name, but constant on flag level {level} while the flag's other "
+                             f"values are constant on level {indicator.off_level}"))
+            continue
+        indicator.fills[value] = float(v[x == level][0])
+        indicator.named.append(value)
+        named.add(value)
 
     # 2. values without a flag of their own name, statistically:
     #    rule S (any 0/1 input as the flag): one value on every row of a flag level and on at most

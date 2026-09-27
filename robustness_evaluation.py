@@ -52,12 +52,8 @@ Outputs (default: <run>/evaluation/robustness/; robustness_<rule>/ for a Pareto 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
-import io
 import os
-import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -68,9 +64,8 @@ import numpy
 import pandas
 from scipy.stats import rankdata, spearmanr, wilcoxon
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.preprocessing import StandardScaler
 
-from checkpoint_utils import (FINGERPRINT_FILE, TrainingCheckpointStore, array_fingerprint,
+from checkpoint_utils import (FINGERPRINT_FILE, TrainingCheckpointStore, _library_versions, array_fingerprint,
                               atomic_write_json, atomic_write_text, read_json, source_fingerprint)
 from evaluation_utils import (build_model_package, compute_marginal_correlations,
                               compute_model_sign_consistency, predict_scores)
@@ -84,6 +79,8 @@ from robustness_utils import (CorruptionBank, DependenceTilt, FeatureSchema, cal
                               exponential_tilt, infer_feature_schema, normalise_within_classes,
                               population_axes, weighted_average_precision, weighted_correlation,
                               weighted_roc_auc)
+from run_manifest import (git_state, load_archived_run, load_run_data, manifest_sha256,  # noqa: F401
+                          verify_training_data)
 from training_utils import ensure_directory, repository_root, select_pareto_individual
 
 METHODS: tuple[str, ...] = ("multi", "single", "forward", "all")
@@ -155,10 +152,15 @@ def build_final_models(
         single_best: dict[int, Any],
         forward_masks: dict[int, list[int]],
         all_masks: dict[int, list[int]],
-        use_knee_point: bool) -> dict[int, dict[str, dict]]:
+        use_knee_point: bool,
+        record_directory: str | None = None) -> dict[int, dict[str, dict]]:
     """The final model of every method and seed, refit on the whole training set:
     `{seed: {"multi": package, "single": ..., "all": ..., "forward": ...}}`. MORSE is the individual of
-    the seed's Pareto front picked by the pipeline's rule (`select_pareto_individual`)."""
+    the seed's Pareto front picked by the pipeline's rule (`select_pareto_individual`).
+
+    With `record_directory` (the run's evaluation folder), the fitted models are recorded there as
+    final_models_<rule>.json the first time and checked against that record every later time
+    (`record_final_models`), so a re-evaluation provably uses the same models."""
     packages: dict[int, dict[str, dict]] = {}
     for seed in seeds:
         morse = select_pareto_individual(pareto_fronts[seed], use_knee_point=use_knee_point)
@@ -168,7 +170,15 @@ def build_final_models(
             "all":     build_model_package(all_masks[seed], feature_names, X_train, y_train, seed=seed),
             "forward": build_model_package(forward_masks[seed], feature_names, X_train, y_train, seed=seed),
         }
+    if record_directory is not None:
+        ensure_directory(record_directory)
+        record_final_models(packages, final_models_path(record_directory, "knee" if use_knee_point else "max_s"))
     return packages
+
+
+def final_models_path(evaluation_directory: str, rule: str) -> str:
+    """Where the fitted final models of a Pareto rule are recorded."""
+    return os.path.join(evaluation_directory, f"final_models_{rule}.json")
 
 
 @dataclass
@@ -234,16 +244,24 @@ def run_robustness_suite(
         output_directory: str,
         config: RobustnessConfig | None = None,
         run_directory: str | None = None,
-        log: Callable[[str], None] = print) -> RobustnessResults:
+        log: Callable[[str], None] = print,
+        selection_rule: str | None = None) -> RobustnessResults:
     """Evaluate the final models (`build_final_models`) under every automatically generated stress and
     write the tables, the figures and the report to `output_directory` (see the module docstring).
 
     X_train / y_train: the training data the models were fit on (the scenarios are derived from them);
     X_test / y_test:   the test set that is re-weighted and corrupted;
-    run_directory:     the run folder, recorded in config.json together with its checkpoint fingerprint.
+    run_directory:     the run folder, recorded in config.json together with its checkpoint fingerprint
+                       and its run manifest;
+    selection_rule:    MORSE's Pareto rule ("knee" / "max_s"), recorded in config.json.
+
+    config.json is written first (status "running") and every stage's tables as soon as the stage is
+    done, so an interrupted evaluation keeps what it finished; config.json says "complete" at the end.
+    A folder that holds an evaluation of other data or of another rule is not overwritten.
     """
     config = config or RobustnessConfig()
     started: float = time.time()
+    started_at: datetime = datetime.now()
     lines: list[str] = []
 
     def say(line: str = "") -> None:
@@ -254,7 +272,13 @@ def run_robustness_suite(
     X_test = X_test[features]
     y_tr: numpy.ndarray = numpy.asarray(y_train).astype(int)
     y_te: numpy.ndarray = numpy.asarray(y_test).astype(int)
+    fingerprints: dict[str, Any] = data_fingerprints(X_train, y_tr, X_test, y_te)
     ensure_directory(output_directory)
+    _refuse_other_evaluations(output_directory, fingerprints, selection_rule, say)
+
+    def save(frames: dict[str, pandas.DataFrame]) -> None:
+        for name, frame in frames.items():
+            frame.to_csv(os.path.join(output_directory, name), index=False)
 
     # ---- models and their clean scores
     models: list[_Model] = _model_instances(model_packages, features, say)
@@ -279,6 +303,11 @@ def run_robustness_suite(
     models_frame: pandas.DataFrame = pandas.DataFrame(model_rows)
     models_frame["seed"] = models_frame["seed"].astype("Int64")
 
+    atomic_write_json(os.path.join(output_directory, "config.json"),
+                      _provenance(config, run_directory, fingerprints, models_frame, selection_rule, "running",
+                                  started_at))
+    save({"models.csv": models_frame})
+
     counts: dict[str, int] = {method: sum(model.method == method for model in models) for method in METHODS}
     say(f"Robustness suite: {len(y_tr)} training rows, {len(y_te)} test rows "
         f"({int(y_te.sum())} positive), {len(features)} inputs; models: "
@@ -298,6 +327,7 @@ def run_robustness_suite(
         f"{summary_counts['unresolved_availability']} unresolved (schema.json). "
         f"{summary_counts['unseen_combinations']} combinations of 0/1 values never seen in training "
         f"(a diagnostic: the corruptions may create them).")
+    atomic_write_json(os.path.join(output_directory, "schema.json"), schema.to_dict())
 
     # ---- re-weighted populations
     scenarios, reweighting_scores, n_eligible_pairs, n_pairs = _reweighting(
@@ -307,11 +337,13 @@ def run_robustness_suite(
         f"supported by enough effective rows); dependence pairs: {n_eligible_pairs} eligible, {n_pairs} used.")
     say(f"Cohorts -- the units usable at every level of their family, which the main analysis uses: "
         f"{_cohort_line(scenarios)}.")
+    save({"scenarios.csv": scenarios, "reweighting_scores.csv": reweighting_scores})
 
     # ---- corrupted test sets
     corruption_scores, diagnostics, applicable, clean_violations = _corruption(
         X_train, X_test, y_te, schema, models, clean, config)
     say("Corruption families: " + (", ".join(applicable) if applicable else "none applicable") + ".")
+    save({"corruption_scores.csv": corruption_scores, "corruption_diagnostics.csv": diagnostics})
     if clean_violations:
         say(f"NOTE: {clean_violations} clean test values do not hold their fill value although their availability "
             f"flag says 'not available'; they are left as they are.")
@@ -347,18 +379,10 @@ def run_robustness_suite(
     per_level_tests: pandas.DataFrame = _tests(per_level_scores, scenarios, reweighting_scores, cohort_only=False)
 
     # ---- files
-    atomic_write_json(os.path.join(output_directory, "config.json"),
-                      _provenance(config, run_directory, X_train, X_test, models_frame))
-    atomic_write_json(os.path.join(output_directory, "schema.json"), schema.to_dict())
-    tables: dict[str, pandas.DataFrame] = {
-        "models.csv": models_frame, "scenarios.csv": scenarios, "reweighting_scores.csv": reweighting_scores,
-        "corruption_scores.csv": corruption_scores, "corruption_diagnostics.csv": diagnostics,
-        "model_family_scores.csv": all_family_scores, "summary.csv": summary, "tests.csv": tests,
-        "sign_vs_degradation.csv": sign_summary, "supplementary_per_level_summary.csv": per_level_summary,
-        "supplementary_per_level_tests.csv": per_level_tests}
-    for name, frame in tables.items():
-        frame.to_csv(os.path.join(output_directory, name), index=False)
-    sign_points.to_csv(os.path.join(output_directory, "sign_vs_degradation_points.csv"), index=False)
+    save({"model_family_scores.csv": all_family_scores, "summary.csv": summary, "tests.csv": tests,
+          "sign_vs_degradation.csv": sign_summary, "sign_vs_degradation_points.csv": sign_points,
+          "supplementary_per_level_summary.csv": per_level_summary,
+          "supplementary_per_level_tests.csv": per_level_tests})
 
     _figures(output_directory, config, scenarios, reweighting_scores, corruption_scores, family_scores,
              models_frame, sign_points, sign_summary)
@@ -368,6 +392,9 @@ def run_robustness_suite(
     say(f"\nRobustness suite finished in {time.time() - started:.0f} s; outputs in {output_directory}")
     report: str = "\n".join(lines) + "\n"
     atomic_write_text(os.path.join(output_directory, "report.txt"), report)
+    atomic_write_json(os.path.join(output_directory, "config.json"),
+                      _provenance(config, run_directory, fingerprints, models_frame, selection_rule, "complete",
+                                  started_at, time.time() - started))
     return RobustnessResults(output_directory=output_directory, schema=schema, models=models_frame,
                              scenarios=scenarios, model_family_scores=family_scores, summary=summary,
                              tests=tests, report=report)
@@ -921,105 +948,113 @@ def _report_lines(summary: pandas.DataFrame, tests: pandas.DataFrame, sign_summa
     return lines
 
 
-def _git_state() -> dict[str, Any]:
-    try:
-        commit: str = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repository_root(), capture_output=True,
-                                     text=True, timeout=10).stdout.strip()
-        dirty: str = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repository_root(),
-                                    capture_output=True, text=True, timeout=10).stdout.strip()
-        return {"commit": commit or "unknown", "uncommitted_changes": bool(dirty)}
-    except (OSError, subprocess.SubprocessError):
-        return {"commit": "unknown", "uncommitted_changes": None}
+def data_fingerprints(X_train: pandas.DataFrame, y_train: Sequence[float], X_test: pandas.DataFrame,
+                      y_test: Sequence[float]) -> dict[str, Any]:
+    """Fingerprints of the evaluated data (inputs in the training column order), as run_manifest.json
+    records them."""
+    features: list[str] = list(X_train.columns)
+
+    def fingerprint(values: Any) -> dict[str, Any]:
+        return array_fingerprint(numpy.ascontiguousarray(numpy.asarray(values, dtype=numpy.float64)))
+
+    return {"X_train": fingerprint(X_train.to_numpy(dtype=numpy.float64)), "y_train": fingerprint(y_train),
+            "X_test": fingerprint(X_test[features].to_numpy(dtype=numpy.float64)), "y_test": fingerprint(y_test)}
 
 
-def _provenance(config: RobustnessConfig, run_directory: str | None, X_train: pandas.DataFrame,
-                X_test: pandas.DataFrame, models_frame: pandas.DataFrame) -> dict[str, Any]:
+def _provenance(config: RobustnessConfig, run_directory: str | None, fingerprints: dict[str, Any],
+                models_frame: pandas.DataFrame, selection_rule: str | None, status: str,
+                started: datetime, runtime_seconds: float | None = None) -> dict[str, Any]:
     training_fingerprint: str | None = None
     if run_directory:
         path: str = os.path.join(run_directory, "checkpoints", "training", FINGERPRINT_FILE)
         if os.path.isfile(path):
             with open(path, "rb") as handle:
                 training_fingerprint = hashlib.sha256(handle.read().replace(b"\r\n", b"\n")).hexdigest()
+    shape: tuple[int, ...] = tuple(fingerprints["X_train"]["shape"])
     return {
-        "created": datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "created": started.isoformat(timespec="seconds"),
+        "runtime_seconds": None if runtime_seconds is None else round(runtime_seconds, 1),
         "config": config.to_dict(),
         "run_directory": run_directory,
+        "selection_rule": selection_rule,
         "training_fingerprint_sha256": training_fingerprint,
-        "data": {"train_rows": int(len(X_train)), "test_rows": int(len(X_test)), "inputs": int(X_train.shape[1])},
+        "run_manifest_sha256": manifest_sha256(run_directory) if run_directory else None,
+        "data": {"train_rows": int(shape[0]), "test_rows": int(fingerprints["X_test"]["shape"][0]),
+                 "inputs": int(shape[1]) if len(shape) > 1 else 0, "fingerprints": fingerprints},
         "models": {method: int((models_frame["method"] == method).sum()) for method in METHODS},
         "seeds": sorted(int(s) for s in models_frame["seed"].dropna().unique()),
-        "git": _git_state(),
+        "git": git_state(),
         "source_sha256": source_fingerprint((robustness_utils, plot_utils, sys.modules[__name__],
                                              sys.modules[RobustnessConfig.__module__])),
     }
 
 
+def _refuse_other_evaluations(output_directory: str, fingerprints: dict[str, Any], selection_rule: str | None,
+                              say: Callable[[str], None]) -> None:
+    """An output folder that already holds an evaluation of other data or of another Pareto rule is not
+    overwritten (the same evaluation repeated is fine)."""
+    path: str = os.path.join(output_directory, "config.json")
+    if not os.path.isfile(path):
+        return
+    previous: dict[str, Any] = read_json(path)
+    previous_fingerprints: Any = previous.get("data", {}).get("fingerprints")
+    previous_rule: Any = previous.get("selection_rule")
+    problems: list[str] = []
+    if previous_fingerprints is not None and previous_fingerprints != fingerprints:
+        problems.append("other data")
+    if previous_rule is not None and selection_rule is not None and previous_rule != selection_rule:
+        problems.append(f"the Pareto rule {previous_rule!r} (now {selection_rule!r})")
+    if problems:
+        raise FileExistsError(f"{output_directory} holds an evaluation of {' and of '.join(problems)}; choose "
+                              f"another output folder (--out) or remove that one")
+    if previous_fingerprints is None:
+        say(f"NOTE: {output_directory} holds an evaluation made before the data were recorded; it is replaced.")
+
+
+def record_final_models(packages: dict[int, dict[str, dict]], path: str, tolerance: float = 1e-8) -> str:
+    """Record the fitted final models -- inputs, scaler, coefficients, intercept of every method and seed --
+    in `path` the first time, and check them against the record every later time: a re-evaluation refits
+    the models from the checkpointed masks, and a newer library or code could fit them differently. Returns
+    the record's SHA-256. Raises RuntimeError when a refit differs by more than `tolerance`."""
+    models: dict[str, dict[str, Any]] = {}
+    for seed in sorted(packages):
+        for method, package in packages[seed].items():
+            models[f"{method}/{seed}"] = {
+                "features": list(package["features"]),
+                "scaler_mean": package["scaler"].mean_.tolist(), "scaler_scale": package["scaler"].scale_.tolist(),
+                "coef": package["model"].coef_.ravel().tolist(), "intercept": float(package["model"].intercept_[0])}
+    record: dict[str, Any] = {"schema_version": 1, "libraries": _library_versions(), "models": models}
+    if os.path.isfile(path):
+        stored: dict[str, Any] = read_json(path)
+        problems: list[str] = []
+        for key, model in models.items():
+            before: dict[str, Any] | None = stored.get("models", {}).get(key)
+            if before is None:
+                continue                            # a seed evaluated for the first time: added below
+            if before["features"] != model["features"]:
+                problems.append(f"{key}: other inputs")
+                continue
+            difference: float = max(float(numpy.max(numpy.abs(numpy.subtract(before[part], model[part]), dtype=float),
+                                                    initial=0.0))
+                                    for part in ("scaler_mean", "scaler_scale", "coef", "intercept"))
+            if difference > tolerance:
+                problems.append(f"{key}: parameters differ by up to {difference:.2g}")
+        if problems:
+            raise RuntimeError(f"the final models refit now differ from those recorded in {path} ("
+                               + "; ".join(problems[:5]) + ("; ..." if len(problems) > 5 else "")
+                               + "): the library versions or the code changed since. Remove the file to "
+                                 "accept the new models.")
+        record["models"] = {**stored.get("models", {}), **models}
+        record["libraries"] = stored.get("libraries", record["libraries"])
+    atomic_write_json(path, record)
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read().replace(b"\r\n", b"\n")).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Stand-alone use on a finished run
 # ---------------------------------------------------------------------------
-
-def load_archived_run(run_directory: str, notebook: str | None = None) -> dict[str, Any]:
-    """Rebuild a run's training and test data by executing the configuration and data-loading cells of
-    the copy of training_notebook.ipynb archived in the run folder (or of the copy `notebook`): every
-    code cell from the first one that assigns TARGET_COLUMN to the first one that assigns X_test. This
-    reproduces the exact inputs of the run (paths, merged validation file, column whitelist) without
-    restating them. The result is checked against the run's checkpoint fingerprint by
-    `verify_training_data`."""
-    path: str = notebook or os.path.join(run_directory, "training_notebook.ipynb")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"{path} does not exist: the run folder has no archived copy of the notebook, "
-                                f"so its data cannot be rebuilt (pass a copy of the notebook that has the run's "
-                                f"data settings with --notebook)")
-    sources: list[str] = ["".join(cell.get("source", [])) for cell in read_json(path).get("cells", [])
-                          if cell.get("cell_type") == "code"]
-    start: int | None = next((i for i, source in enumerate(sources)
-                              if re.search(r"^TARGET_COLUMN\b", source, re.MULTILINE)), None)
-    end: int | None = None if start is None else next(
-        (i for i in range(start, len(sources)) if re.search(r"^X_test\b", sources[i], re.MULTILINE)), None)
-    if start is None or end is None:
-        raise ValueError(f"{path}: no configuration cell (TARGET_COLUMN = ...) followed by a data cell "
-                         f"(X_test = ...) was found")
-    namespace: dict[str, Any] = {"os": os, "time": time, "numpy": numpy, "pandas": pandas,
-                                 "repository_root": repository_root, "__name__": "archived_notebook"}
-    previous: str = os.getcwd()
-    os.chdir(repository_root())   # the cells use paths relative to the repository root
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            for source in sources[start:end + 1]:
-                exec(compile(source, path, "exec"), namespace)
-    finally:
-        os.chdir(previous)
-    target: str = namespace["TARGET_COLUMN"]
-    df_train: pandas.DataFrame = namespace["df_train"]
-    return {"X_train": df_train.drop(columns=[target]), "y_train": df_train[target],
-            "X_test": namespace["X_test"], "y_test": namespace["y_test"],
-            "use_knee_point": bool(namespace.get("USE_KNEE_POINT_SELECTION", True))}
-
-
-def verify_training_data(run_directory: str, X_train: pandas.DataFrame, y_train: Sequence[float]) -> dict[str, Any]:
-    """Check that the training data are those the run's checkpoints were trained on -- the feature names
-    and the hashes of the standardised training matrix and of the labels, recomputed exactly as the
-    notebook computes them (checkpoint_utils.build_training_fingerprint) -- and return the fingerprint."""
-    fingerprint: dict[str, Any] = read_json(os.path.join(run_directory, "checkpoints", "training", FINGERPRINT_FILE))
-    names: list[str] = list(X_train.columns)
-    X_search: numpy.ndarray = numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64)
-    current: dict[str, Any] = {
-        "features": {"count": len(names), "sha256": hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()},
-        "X_train": array_fingerprint(StandardScaler().fit_transform(X_search)),
-        "y_train": array_fingerprint(numpy.ascontiguousarray(numpy.asarray(y_train), dtype=numpy.float64)),
-    }
-    settings: dict[str, Any] = fingerprint.get("settings", {})
-    problems: list[str] = []
-    if settings.get("features") != current["features"]:
-        problems.append("the input variables (names or order) differ")
-    for part in ("X_train", "y_train"):
-        if settings.get("data", {}).get(part) != current[part]:
-            problems.append(f"the training data ({part}) differ")
-    if problems:
-        raise ValueError(f"the rebuilt data do not match the checkpoints of {run_directory}: "
-                         + "; ".join(problems))
-    return fingerprint
-
 
 @dataclass
 class RunModels:
@@ -1035,6 +1070,7 @@ class RunModels:
     own_rule: str               # ... and the run's own rule ("knee" / "max_s")
     use_roc_auc: bool           # the run's main objective
     fingerprint: dict[str, Any]
+    source: str = ""            # where the data came from: run manifest / archived notebook / notebook copy
 
     @property
     def rule(self) -> str:
@@ -1049,27 +1085,30 @@ class RunModels:
 
 def load_run_models(run: str, selection: str = "auto", seeds: Sequence[int] | None = None,
                     notebook: str | None = None, say: Callable[[str], None] = print) -> RunModels:
-    """Rebuild a checkpointed run: its data (checked against the checkpoint fingerprint) and the final
-    models of `seeds` (default: every seed with a complete checkpoint). `selection` picks MORSE's Pareto
-    solution: "auto" = the run's own rule, or "knee" / "max_s"."""
+    """Rebuild a checkpointed run: its data (from the run manifest, the archived notebook or the notebook
+    copy `notebook`; checked against the checkpoint fingerprint) and the final models of `seeds` (default:
+    every seed with a complete checkpoint), recorded / checked in the run's evaluation folder. `selection`
+    picks MORSE's Pareto solution: "auto" = the run's own rule, or "knee" / "max_s"."""
     directory: str = os.path.normpath(run if os.path.isabs(run) else os.path.join(repository_root(), run))
-    data: dict[str, Any] = load_archived_run(directory, notebook)
+    data: dict[str, Any] = load_run_data(directory, notebook)
     fingerprint: dict[str, Any] = verify_training_data(directory, data["X_train"], data["y_train"])
     store: TrainingCheckpointStore = TrainingCheckpointStore(os.path.join(directory, "checkpoints", "training"),
                                                              fingerprint)
     chosen: list[int] = sorted(seeds) if seeds else store.completed_seeds()
     fronts, single, forward, everything = store.load_all(chosen)
     use_knee_point: bool = data["use_knee_point"] if selection == "auto" else selection == "knee"
-    say(f"Run {directory}: {len(chosen)} seeds; MORSE = the {'knee point' if use_knee_point else 'max-S end'} "
-        f"of every Pareto front.")
+    say(f"Run {directory} (data from its {data['source']}): {len(chosen)} seeds; MORSE = the "
+        f"{'knee point' if use_knee_point else 'max-S end'} of every Pareto front.")
     packages: dict[int, dict[str, dict]] = build_final_models(
         list(data["X_train"].columns), data["X_train"], data["y_train"], chosen, fronts, single, forward,
-        everything, use_knee_point)
+        everything, use_knee_point, record_directory=os.path.join(directory, "evaluation"))
+    use_roc_auc: Any = data.get("use_roc_auc")
+    if use_roc_auc is None:
+        use_roc_auc = fingerprint.get("settings", {}).get("training_config", {}).get("use_roc_auc", True)
     return RunModels(directory=directory, X_train=data["X_train"], y_train=data["y_train"], X_test=data["X_test"],
                      y_test=data["y_test"], packages=packages, seeds=chosen, use_knee_point=use_knee_point,
-                     own_rule="knee" if data["use_knee_point"] else "max_s",
-                     use_roc_auc=bool(fingerprint.get("settings", {}).get("training_config", {}).get("use_roc_auc", True)),
-                     fingerprint=fingerprint)
+                     own_rule="knee" if data["use_knee_point"] else "max_s", use_roc_auc=bool(use_roc_auc),
+                     fingerprint=fingerprint, source=data["source"])
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1096,7 +1135,7 @@ def main(argv: list[str] | None = None) -> None:
     run_robustness_suite(run.X_train, run.y_train, run.X_test, run.y_test, run.packages,
                          output_directory=arguments.out or os.path.join(run.directory, "evaluation",
                                                                         "robustness" + run.folder_suffix),
-                         run_directory=run.directory)
+                         run_directory=run.directory, selection_rule=run.rule)
 
 
 if __name__ == "__main__":

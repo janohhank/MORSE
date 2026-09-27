@@ -24,17 +24,22 @@ picked after seeing which one favours a method.
   python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
   ```
 
-  The run's data are rebuilt by executing the configuration and data-loading cells of the notebook copy
-  archived in the run folder: every code cell from the first one that assigns `TARGET_COLUMN` to the
-  first one that assigns `X_test`. This reproduces the run's paths, the merged validation file and any
-  column whitelist. The rebuilt training data are then checked against the run's checkpoint fingerprint
-  (feature names, hashes of the standardised training matrix and of the labels). The models are refit
-  from the checkpointed masks. A run folder without an archived notebook can use a copy given with
-  `--notebook` (the fingerprint check still applies).
+  The run's data are rebuilt from its **`run_manifest.json`** (`run_manifest.py`), which the notebook
+  writes before training starts: the CSV files the training and test data came from (the list that
+  reproduces the data exactly, including a merged validation file and the input order of a column
+  whitelist), their SHA-256 hashes and fingerprints of the arrays; the files must still give those arrays.
+  Runs made before the manifest existed are rebuilt by executing the configuration and data-loading cells
+  of the notebook copy archived in the run folder (every code cell from the first one that assigns
+  `TARGET_COLUMN` to the first one that assigns `X_test`), or of a copy given with `--notebook`. Either
+  way, the training data are then checked against the run's checkpoint fingerprint (feature names,
+  hashes of the standardised training matrix and of the labels). The models are refit from the
+  checkpointed masks and checked against `evaluation/final_models_<rule>.json` (recorded the first time).
   Options: `--selection auto|knee|max_s` picks MORSE's Pareto solution (`auto` uses the run's own rule;
   another rule writes to `robustness_<rule>/`, so it never overwrites the run's own evaluation),
-  `--seeds 42 43 ...` evaluates a subset of seeds, and `--out` sets another output folder.
-  A run takes about 0.5–1 minute per dataset.
+  `--seeds 42 43 ...` evaluates a subset of seeds, and `--out` sets another output folder. A folder that
+  holds an evaluation of other data or of another rule is never overwritten, and every stage is saved
+  as soon as it is done (`config.json` says `"running"` until the end).
+  A run takes about 1–1.5 minutes per dataset.
 
 ## Two kinds of stress
 
@@ -287,7 +292,7 @@ every seed, that band was pure corruption noise. The bank separates the two.
 
 | file | content |
 |---|---|
-| `config.json` | the settings, the git commit, source hashes, the training fingerprint's hash |
+| `config.json` | the status (running / complete) and runtime, the settings, MORSE's Pareto rule, fingerprints of the training and test data, the hashes of the run manifest and of the training fingerprint, the git commit, source hashes |
 | `schema.json` | the inferred feature schema: types, one-hot groups, availability pairs (by name / statistically), unresolved pairs, unseen combinations |
 | `models.csv` | every final model: size, sign consistency, clean ROC-AUC / PR-AUC |
 | `scenarios.csv` | every re-weighting scenario: level, strength, training/test/per-class ESS, `attainable` / `supported` / `usable` / `in_cohort`, and what actually moved (statistic shift; for a pair the target and reached score correlation and the raw correlation before/after on the training and test rows, mean shifts, SD ratios, balance error) |
