@@ -23,7 +23,10 @@ from evaluation_utils import (apply_dummy_noise, apply_proportional_noise, build
                               compute_aurs, compute_marginal_correlations, compute_model_sign_consistency,
                               covariate_shift_weights, evaluate_model, find_balanced_threshold,
                               fit_covariate_shift_axis, get_continuous_columns, get_dummy_columns,
-                              predict_scores, score_predictions)
+                              predict_scores, score_predictions, select_deployment_model)
+from deap import creator  # noqa: E402
+from deap_types import ensure_multi_objective_types  # noqa: E402
+from sklearn.model_selection import StratifiedKFold  # noqa: E402
 
 
 def make_frame(n: int = 400, seed: int = 0) -> tuple[pandas.DataFrame, pandas.Series]:
@@ -166,6 +169,48 @@ class LegacyStressTests(unittest.TestCase):
         clipped = weights[negatives][score[negatives] >= 2.0]
         if clipped.size > 1:
             self.assertAlmostEqual(clipped.min(), clipped.max(), places=12)
+
+
+class DeploymentModelTests(unittest.TestCase):
+    """The best MORSE model is chosen without the test set (review point 3)."""
+
+    def setUp(self):
+        ensure_multi_objective_types()
+        self.X, self.y = make_frame(400, seed=3)
+        self.features = list(self.X.columns)
+        self.cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+        def front(mask, cv_objective):
+            individual = creator.Individual(mask + [0] * (len(self.features) - len(mask)))
+            individual.fitness.values = (cv_objective, 0.9)
+            return [individual]
+
+        # seed 3 ties with seed 2 on the cross-validated objective: the smaller seed wins
+        self.fronts = {1: front([1, 1], 0.80), 2: front([1, 1, 1, 1], 0.85), 3: front([1, 0, 1], 0.85)}
+
+    def choose(self):
+        return select_deployment_model(self.fronts, [1, 2, 3], self.features, self.X, self.y, self.cv,
+                                       use_knee_point=True)
+
+    def test_the_seed_with_the_best_cross_validated_objective_is_chosen(self):
+        chosen = self.choose()
+        self.assertEqual((chosen["seed"], chosen["cv_objective"]), (2, 0.85))
+        self.assertEqual(chosen["package"]["features"], self.features[:4])
+        self.assertIs(chosen["individual"], self.fronts[2][0])
+
+    def test_the_threshold_balances_the_out_of_fold_predictions(self):
+        chosen = self.choose()
+        X = self.X[self.features[:4]].to_numpy(dtype=float)
+        y = self.y.to_numpy()
+        expected = numpy.zeros(len(y))
+        for train, held_out in self.cv.split(X, y):
+            scaler = StandardScaler().fit(X[train])
+            model = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=2).fit(scaler.transform(X[train]),
+                                                                                            y[train])
+            expected[held_out] = model.predict_proba(scaler.transform(X[held_out]))[:, 1]
+        numpy.testing.assert_allclose(chosen["oof_scores"], expected, rtol=0, atol=1e-12)
+        self.assertEqual(chosen["threshold"], find_balanced_threshold(y, expected)["threshold"])
+        self.assertEqual(chosen["balanced"]["threshold"], chosen["threshold"])
 
 
 class AursTests(unittest.TestCase):

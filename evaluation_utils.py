@@ -9,6 +9,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
+from training_utils import select_pareto_individual
+
 # ---------------------------------------------------------------------------
 # Sign consistency score calculation
 # ---------------------------------------------------------------------------
@@ -520,6 +522,65 @@ def find_balanced_threshold(
         "specificity_curve": specificity,
         "y_pred":            y_pred,
     }
+
+
+# ---------------------------------------------------------------------------
+# The single deployment model, chosen without the test set
+# ---------------------------------------------------------------------------
+
+def out_of_fold_scores(
+        package: dict[str, Any],
+        X_train: pandas.DataFrame,
+        y_train: Union[numpy.ndarray, pandas.Series],
+        cv: Any,
+        seed: int) -> numpy.ndarray:
+    """Out-of-fold predicted probabilities of a model package's specification on the training data: for
+    every fold of `cv`, a fresh StandardScaler and the same logistic regression as `build_model_package`
+    are fit on the other folds and predict the held-out rows."""
+    features: list[str] = package["features"]
+    X: numpy.ndarray = X_train[features].to_numpy(dtype=float)
+    y: numpy.ndarray = numpy.asarray(y_train).astype(int)
+    scores: numpy.ndarray = numpy.zeros(len(y))
+    for train_rows, held_out in cv.split(X, y):
+        scaler: StandardScaler = StandardScaler().fit(X[train_rows])
+        model: LogisticRegression = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=seed)
+        model.fit(scaler.transform(X[train_rows]), y[train_rows])
+        scores[held_out] = model.predict_proba(scaler.transform(X[held_out]))[:, 1]
+    return scores
+
+
+def select_deployment_model(
+        pareto_fronts: dict[int, list],
+        seeds: list[int],
+        feature_names: list[str],
+        X_train: pandas.DataFrame,
+        y_train: Union[numpy.ndarray, pandas.Series],
+        cv: Any,
+        use_knee_point: bool) -> dict[str, Any]:
+    """The single MORSE model to deploy, chosen WITHOUT the test set.
+
+    * Seed: the one whose selected Pareto solution (knee point or max-S end, like everywhere else) has the
+      best cross-validated main objective -- the GA's own first fitness value, computed on the same
+      folds for every seed; a tie goes to the smallest seed. Choosing the seed by its TEST score instead
+      picks the luckiest of the seeds on that test set, so the reported test score is optimistic.
+    * Threshold: the one at which sensitivity and specificity are closest on OUT-OF-FOLD predictions of
+      the training data (`out_of_fold_scores`, the same CV splitter). A threshold found on the test labels
+      is fitted to the very rows it is then evaluated on.
+    The test set is then used once, to evaluate the chosen model at the chosen threshold.
+
+    Returns {"seed", "individual", "cv_objective", "package" (refit on the whole training set),
+    "oof_scores", "threshold", "balanced" (find_balanced_threshold on the out-of-fold predictions)}.
+    """
+    candidates: list[tuple[float, int, Any]] = []
+    for seed in seeds:
+        individual = select_pareto_individual(pareto_fronts[seed], use_knee_point=use_knee_point)
+        candidates.append((float(individual.fitness.values[0]), seed, individual))
+    cv_objective, seed, individual = max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))
+    package: dict[str, Any] = build_model_package(individual, feature_names, X_train, y_train, seed=seed)
+    oof: numpy.ndarray = out_of_fold_scores(package, X_train, y_train, cv, seed)
+    balanced: dict[str, Any] = find_balanced_threshold(y_train, oof)
+    return {"seed": seed, "individual": individual, "cv_objective": cv_objective, "package": package,
+            "oof_scores": oof, "threshold": balanced["threshold"], "balanced": balanced}
 
 
 # ---------------------------------------------------------------------------

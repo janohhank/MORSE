@@ -138,7 +138,7 @@ data through its official access pathway and add a matching config block.
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
 | `training_utils` | `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
-| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), and `find_balanced_threshold`. The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
+| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `find_balanced_threshold`, and `select_deployment_model` / `out_of_fold_scores` (the best MORSE model and its threshold, chosen without the test set). The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
 | `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
 | `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
 | `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
@@ -210,7 +210,7 @@ YYYY-MM-DD_HH-MM-SS/
     ├── all_models_comparison/            # legacy stress grid (optional block): per-seed CSVs, AURS, four figures
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
     ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
-    └── best_morse_model/                 # best-seed metrics CSV + sensitivity/specificity curve PDF
+    └── best_morse_model/                 # the model chosen without the test set: metrics CSV + curve PDF
 ```
 
 ### Checkpoints and resuming a run
@@ -407,11 +407,15 @@ corresponding code cells:
   it during selection. Read it together with the feature counts: a model with
   a single feature is trivially 100% consistent. Boxplot + per-seed and
   summary CSVs.
-- **Best-MORSE-model deployment report** — the seed whose MORSE model achieves
-  the highest test AUC is selected; at the balanced sensitivity ≈ specificity
-  threshold it reports accuracy, ROC-AUC, PR-AUC, F1, sensitivity, and
-  specificity (CSV), alongside the sensitivity/specificity-vs-threshold curve
-  (PDF).
+- **Best-MORSE-model report, chosen without the test set** — the seed whose
+  selected Pareto solution has the best cross-validated objective, and the
+  threshold at which sensitivity ≈ specificity on out-of-fold predictions of
+  the training data (`evaluation_utils.select_deployment_model`); the test set
+  is used once, to report accuracy, ROC-AUC, PR-AUC, F1, sensitivity,
+  specificity and balanced accuracy at that threshold (CSV), alongside the
+  out-of-fold sensitivity/specificity-vs-threshold curve (PDF). An earlier
+  version chose the seed and the threshold on the test set, which made its
+  numbers optimistic.
 
 ### Scope & possible extensions
 
