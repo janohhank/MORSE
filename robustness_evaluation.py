@@ -258,7 +258,13 @@ def run_robustness_suite(
         f"({summary_counts['one_hot_groups']} one-hot groups with {summary_counts['one_hot_levels']} levels, "
         f"{summary_counts['availability_flags']} availability flags, {summary_counts['stand_alone_binary']} "
         f"stand-alone), {summary_counts['continuous']} continuous, {summary_counts['constant']} constant, "
-        f"{summary_counts['other']} other; {summary_counts['forbidden_combinations']} forbidden 0/1 combinations.")
+        f"{summary_counts['other']} other.")
+    say(f"Availability: {summary_counts['values_with_flag']} values with a flag "
+        f"({summary_counts['values_paired_by_name']} paired by name, "
+        f"{summary_counts['values_paired_statistically']} statistically); "
+        f"{summary_counts['unresolved_availability']} unresolved (schema.json). "
+        f"{summary_counts['unseen_combinations']} combinations of 0/1 values never seen in training "
+        f"(a diagnostic: the corruptions may create them).")
 
     # ---- re-weighted populations
     scenarios, reweighting_scores, n_eligible_pairs, n_pairs = _reweighting(
@@ -268,8 +274,18 @@ def run_robustness_suite(
         f"and not saturated); dependence pairs: {n_eligible_pairs} eligible, {n_pairs} used.")
 
     # ---- corrupted test sets
-    corruption_scores, diagnostics, applicable = _corruption(X_train, X_test, y_te, schema, models, clean, config)
+    corruption_scores, diagnostics, applicable, clean_violations = _corruption(
+        X_train, X_test, y_te, schema, models, clean, config)
     say("Corruption families: " + (", ".join(applicable) if applicable else "none applicable") + ".")
+    if clean_violations:
+        say(f"NOTE: {clean_violations} clean test values do not hold their fill value although their availability "
+            f"flag says 'not available'; they are left as they are.")
+    if not diagnostics.empty:
+        headline: pandas.DataFrame = diagnostics[numpy.isclose(diagnostics["level"], config.headline_corruption_level)]
+        shares: pandas.Series = headline.groupby("family", sort=False)["rows_with_unseen_combination"].mean() / len(y_te)
+        say(f"Test rows with a combination of 0/1 values never seen in training, at level "
+            f"{config.headline_corruption_level:g} (diagnostic): "
+            + ", ".join(f"{FAMILY_LABELS[family]} {share:.0%}" for family, share in shares.items()) + ".")
 
     # ---- summaries
     all_family_scores: pandas.DataFrame = _model_family_scores(scenarios, reweighting_scores, corruption_scores)
@@ -420,7 +436,9 @@ def _sd_ratio(values: numpy.ndarray, shares: numpy.ndarray) -> float:
 
 def _corruption(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: numpy.ndarray,
                 schema: FeatureSchema, models: list[_Model], clean: dict[str, numpy.ndarray],
-                config: RobustnessConfig) -> tuple[pandas.DataFrame, pandas.DataFrame, list[str]]:
+                config: RobustnessConfig) -> tuple[pandas.DataFrame, pandas.DataFrame, list[str], int]:
+    """Every model on every corrupted test set of the bank: (scores, diagnostics per corrupted test set,
+    the applicable families, the number of clean test cells that already break the availability rule)."""
     bank: CorruptionBank = CorruptionBank(schema, X_train, X_test, config.corruption_repetitions,
                                           config.corruption_seed)
     clean_roc: dict[str, float] = {key: weighted_roc_auc(y_test, p) for key, p in clean.items()}
@@ -443,7 +461,7 @@ def _corruption(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: num
     scores: pandas.DataFrame = pandas.DataFrame(score_rows, columns=[
         "family", "level", "repetition", "method", "seed", "roc_auc", "pr_auc", "delta_roc_auc", "delta_pr_auc"])
     scores["seed"] = scores["seed"].astype("Int64")
-    return scores, pandas.DataFrame(diagnostic_rows), applicable
+    return scores, pandas.DataFrame(diagnostic_rows), applicable, bank.clean_availability_violations
 
 
 # ---------------------------------------------------------------------------

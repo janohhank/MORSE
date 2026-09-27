@@ -65,14 +65,22 @@ class RobustnessConfig:
     under_recording_max_prevalence: float = 0.5
 
     # ---- Automatic feature schema (inferred from the training rows) ----------------------------------------
-    # A combination of two 0/1 values that never occurs in training although independence predicts at
-    # least this many rows is treated as impossible; the corruptions never create it.
-    structural_zero_min_expected: float = 5.0
-    # A numeric input is a value with an availability flag if it holds ONE value on every row of one flag
-    # level (at least `value_indicator_min_rows` rows) and that value on at most
-    # `value_indicator_max_other_share` of the other rows.
+    # Availability pairs are found by their names first: a 0/1 flag `<stem>:<suffix>` (or `<stem>_<suffix>`)
+    # with the value `<stem>` or `<stem>:<suffix>`, confirmed by the data (the value holds one fill value on
+    # every row of one flag level). A value that has no flag of its own name (a flag the preprocessing
+    # shared between several values) is paired statistically: it must hold ONE value on every row of one
+    # flag level (at least `value_indicator_min_rows` rows) and that value on at most
+    # `value_indicator_max_other_share` of the other rows. The share rule would miss imputed medians that
+    # are common measured values (e.g. sodium 136), which is why the names come first. For a flag already
+    # confirmed by its name, a value strictly inside its range on all k off rows also joins when k chance
+    # matches are that unlikely: (share of the other rows holding it)^k <= `value_indicator_max_chance`.
     value_indicator_min_rows: int = 10
     value_indicator_max_other_share: float = 0.05
+    value_indicator_max_chance: float = 1e-6
+    # DIAGNOSTIC ONLY: a combination of two 0/1 values that never occurs in training although independence
+    # predicts at least this many rows is counted when a corruption creates it (corruption_diagnostics.csv).
+    # It is an unusual association, not proof of an impossible combination, so it is never prevented.
+    unseen_combination_min_expected: float = 5.0
 
     # ---- Summaries --------------------------------------------------------------------------------------------
     # The severities used for the overview figure and the sign-consistency analysis; the CSV summaries

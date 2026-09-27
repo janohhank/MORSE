@@ -83,6 +83,12 @@ class SuiteTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.directory.name, name)), name)
         with open(os.path.join(self.directory.name, "config.json"), encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["config"]["corruption_repetitions"], 2)
+        diagnostics = pandas.read_csv(os.path.join(self.directory.name, "corruption_diagnostics.csv"))
+        self.assertTrue({"eligible", "selected", "changed", "unseen_combinations",
+                         "rows_with_unseen_combination"} <= set(diagnostics.columns))
+        self.assertIn("Availability: 1 values with a flag (1 paired by name, 0 statistically); 0 unresolved",
+                      self.results.report)
+        self.assertIn("never seen in training, at level 0.5 (diagnostic): Measurement noise 0%", self.results.report)
 
     def test_models_and_clean_scores(self):
         models = self.results.models
@@ -440,6 +446,22 @@ class ModelInstanceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as out:
                 with self.assertRaisesRegex(RuntimeError, "do not reproduce"):
                     run_robustness_suite(self.X, self.y, self.X, self.y, self.packages, out, log=lambda line: None)
+
+
+class CleanViolationTests(unittest.TestCase):
+    def test_a_test_value_that_already_breaks_the_availability_rule_is_reported(self):
+        X, y = make_data(300, seed=81)
+        X_test, y_test = make_data(150, seed=82)
+        row = X_test.index[X_test["lab_measured"] == 0][0]
+        X_test.loc[row, "lab"] = 7.0
+        features = list(X.columns)
+        packages = {1: {m: build_model_package([1] * len(features), features, X, pandas.Series(y), seed=1)
+                        for m in ("multi", "single")}}
+        config = RobustnessConfig(ess_levels=(0.8,), headline_ess=0.8, corruption_levels=(0.5,),
+                                  headline_corruption_level=0.5, corruption_repetitions=1, max_pairs=2)
+        with tempfile.TemporaryDirectory() as out:
+            results = run_robustness_suite(X, y, X_test, y_test, packages, out, config=config, log=lambda line: None)
+        self.assertIn("NOTE: 1 clean test values do not hold their fill value", results.report)
 
 
 class SaturatedPopulationTests(unittest.TestCase):

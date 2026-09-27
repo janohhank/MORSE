@@ -45,9 +45,12 @@ and needs no knowledge of what the features mean.
 
 **Corrupted test sets** change recorded values: measurement noise, recording errors, lost records,
 values that are not available. A corruption does not keep P(y | observed x). It also has to keep the data
-valid: a one-hot group keeps exactly one level, a "not measured" flag keeps its fill value, and no
-combination of 0/1 values is created that never occurs in training. The rules for that are inferred from
-the training data too (next section).
+valid by its **structural** rules: a one-hot group keeps at most one level (exactly one if it is
+exhaustive), and a value whose flag says "not measured" holds its fill value. Those rules are inferred
+from the names and the training data (next section) and checked after every corruption. A combination of
+0/1 values that merely never occurs in training is not treated as impossible: it is an association (some
+of them occur in the test sets), so the corruptions may create it, and the diagnostics count how often
+they do.
 
 The two kinds answer different questions and are reported separately.
 
@@ -57,21 +60,44 @@ Everything is inferred from the **training rows** only:
 
 * **Types.** 0/1 inputs, continuous inputs (more than two distinct values), constants, and "other" (two
   values that are not 0/1; left alone).
-* **Values with an availability flag.** A numeric input that holds one value on every row of one level
-  of a 0/1 flag (at least 10 rows), and that value on at most 5% of the other rows. This is an imputed
-  value with its missing/measured indicator, e.g. `ADM_RATE:missing` = 1 ⇒ `ADM_RATE` = 0.7542, or
-  `albumin:Binary` = 0 ⇒ `albumin:Value` = 3.1. The 5% condition matters: without it, near-empty
-  columns (RadFusion's `hgb:Value` is measured in 0.2% of the exams) look constant on any subgroup.
+* **Values with an availability flag** (an imputed value with its missing/measured indicator, e.g.
+  `ADM_RATE:missing` = 1 ⇒ `ADM_RATE` = 0.7542, or `albumin:Binary` = 0 ⇒ `albumin:Value` = 3.1):
+  * **by name first.** A 0/1 flag `<stem><sep><suffix>` (separator `:`, `_`, `.` or a space) pairs with
+    the continuous input `<stem>` or `<stem><sep><other suffix>` (same separator, so `ADM_RATE:missing`
+    pairs with `ADM_RATE` but not with `ADM_RATE_ALL`). The data must confirm it: the value holds one
+    value on every row of exactly one level of the flag, which is then the "not available" level. The
+    name is the evidence, so any number of rows suffices and the fill may be a common measured value.
+    Relying on the data alone missed 6 of RadFusion's 21 laboratory flags (anion, bilirubin, bun,
+    creatinine, hgb, sodium) and paired `inr:Binary` with `ptt:Value`, because a median fill of rounded
+    lab values is also a frequent measured value (sodium 136 is 18% of the measured values); on College
+    Scorecard it missed 4 of 21 `:missing` flags. Both datasets now pair 21 of 21 by name.
+  * **statistically, for values without a flag of their own name** (a flag the preprocessing shared by a
+    block of values, e.g. College Scorecard's census block under `agege24:missing`): the value holds one
+    value on every row of a flag level (at least 10 rows) and on at most 5% of the other rows. This share
+    rule keeps near-empty columns (RadFusion's `hgb:Value` is measured in 0.2% of the exams) from looking
+    constant on any subgroup. For a flag already confirmed by its name, a value also joins when it holds
+    one value strictly inside its range (an imputed centre, not a structural zero at the minimum) on all
+    k off rows and k chance matches are unlikely: (share of the other rows holding it)^k ≤ 10⁻⁶ — so
+    `ACTMTMID` = 23 on all 452 College Scorecard rows without ACT scores joins `ACTENMID:missing`
+    although 9% of the other rows score 23 too. Missingness is often nested (no faculty data ⇒ no SAT
+    scores either), so a value claimed by several flags belongs to the one with the most off rows.
+  * A value with a flag of its own belongs to that flag only. Name-proposed pairs the data do not
+    confirm, and interior values of a confirmed flag that fail the chance rule, are listed as
+    **unresolved** in `schema.json` and counted in the report; they are not used.
 * **One-hot groups.** 0/1 inputs named `<prefix>_<level>` (pandas' dummy encoding) with at most one of
   them equal to 1 in every training row. The name only *proposes* a group; the data must confirm it. On
   College Scorecard this finds the 8 groups (STABBR, CCSIZSET, AccredAgency, LOCALE, region, ...) and
   rejects `feature_*` (Arrhythmia) and `Outpatient_*` (RadFusion), whose members co-occur. Co-occurrence
   alone cannot find groups reliably: chains of never-together pairs merged 73 unrelated College
   Scorecard columns into one "group".
-* **Forbidden combinations.** A pair of 0/1 values that never occurs together in training although
-  independence predicts at least 5 rows: two levels of a one-hot group, sex-specific codes, a flag that
-  is only ever set together with another one. Combinations predicted to be rarer than that cannot be
-  told apart from chance and are not protected.
+* **Unseen combinations (a diagnostic).** A pair of 0/1 values that never occurs together in training
+  although independence predicts at least 5 rows. Earlier versions treated these as impossible and undid
+  corruptions that created them. They are associations, not impossibilities: on the RadFusion run of
+  2026-09-26, 23 of the 438 occur in the clean test set, and undoing them made the severity levels
+  inexact (masking every available value changed only 1,116 of 1,640, with 524 changes undone). Now they
+  are only counted: `corruption_diagnostics.csv` gives, for every corrupted test set, how many such
+  combinations it created and in how many rows, and the report gives the share of rows at the headline
+  level.
 * **Stand-alone 0/1 inputs** are those in no group and not an availability flag. Those with a training
   prevalence below 50% (1 = the recorded event) are subject to under-recording.
 
@@ -184,16 +210,20 @@ re-weighted prevalence is recorded in `scenarios.csv`.
 | measurement noise | x + p · (training SD) · N(0, 1) on every continuous input; values that are not available keep their fill value |
 | recording noise | every stand-alone 0/1 input, and every one-hot group as one categorical input, is re-drawn from its training distribution with probability p |
 | under-recording | every recorded 1 of a stand-alone 0/1 input with training prevalence below 50% is lost (set to 0) with probability p |
-| values not available | every available value with an availability flag becomes "not available" (flag set, fill value) with probability p; a flag that is never off while another one is on takes that one along |
+| values not available | every available value with an availability flag becomes "not available" (flag set, fill value) with probability p, each flag on its own: at p = 1 every value is withheld |
 
 The levels are 0.1, 0.2, …, 1.0 (`corruption_levels`). The **corruption bank** holds 10 realisations
 per family (`corruption_repetitions`). Their random draws come from their own seed (`corruption_seed`),
 one stream per family, independent of the GA seed. Every model is scored on the very same corrupted
 data, and the same draws are reused at every level (**common random numbers**): the Gaussian noise at
 0.4 is exactly twice that at 0.2, and the cells corrupted at a level are a subset of those corrupted at
-any higher level. After a corruption, a change that created a forbidden combination is undone for that
-row. Of two conflicting changes, only the one that enters at the higher level is undone, which keeps
-the nesting. `corruption_diagnostics.csv` counts what was eligible, selected, changed and undone.
+any higher level. Nothing is undone, so a level means what it says: at level p a share p of the eligible
+cells is corrupted. Availability flags are never re-drawn or under-recorded, so a flag and its values
+always agree. After every corruption the structural rules are checked (0/1 inputs stay 0/1, one-hot
+groups valid, "not available" ⇒ fill value); a violation stops the run. A clean test value that already
+breaks the availability rule (imputed differently) is left as it is and reported.
+`corruption_diagnostics.csv` counts what was eligible, selected and changed, and the unseen 0/1
+combinations created.
 
 The earlier notebook sweeps seeded their noise with the GA seed, so their "SD across seeds" mixed the
 search variability with the corruption draws. For SFS and the all-features model, which are identical in
@@ -225,11 +255,11 @@ every seed, that band was pure corruption noise. The bank separates the two.
 | file | content |
 |---|---|
 | `config.json` | the settings, the git commit, source hashes, the training fingerprint's hash |
-| `schema.json` | the inferred feature schema |
+| `schema.json` | the inferred feature schema: types, one-hot groups, availability pairs (by name / statistically), unresolved pairs, unseen combinations |
 | `models.csv` | every final model: size, sign consistency, clean ROC-AUC / PR-AUC |
 | `scenarios.csv` | every re-weighting scenario: strength, training/test/per-class ESS, support, saturation, and what actually moved (statistic shift, correlation before/after, mean shifts, SD ratios, balance error) |
 | `reweighting_scores.csv`, `corruption_scores.csv` | every model under every scenario / corrupted test set |
-| `corruption_diagnostics.csv` | what every corrupted test set changed |
+| `corruption_diagnostics.csv` | what every corrupted test set changed, and the unseen 0/1 combinations it created |
 | `model_family_scores.csv` | every model per family and severity (`summarised` = False: too few usable pairs) |
 | `summary.csv` | per family, severity and method: stressed score, change, SDs, worst case, clean score |
 | `tests.csv` | MORSE against every baseline |
@@ -250,8 +280,13 @@ every seed, that band was pure corruption noise. The bank separates the two.
   mechanism.
 * On small test sets many dependence scenarios are not supported (Arrhythmia), and strengthening 0/1
   pairs is often saturated (RadFusion). The report shows how many pairs each summary rests on.
-* One-hot groups are only found for pandas-style `<prefix>_<level>` names. Impossible combinations are
-  only protected when at least 5 rows are expected under independence.
+* One-hot groups are only found for pandas-style `<prefix>_<level>` names, and availability flags by name
+  only for `<stem><sep><suffix>` names; other flags depend on the statistical rules. Genuine
+  impossibilities other than those two structures (e.g. a sex-specific code) are not known to the suite:
+  recording noise can create them, as real recording errors do, and the diagnostics count them.
+* Values not available are withheld flag by flag. Real missingness often comes in panels (a whole blood
+  count at once), so intermediate levels create combinations never seen in training; the diagnostics
+  count them.
 * Measurement noise ignores bounds and integer values: the models are frozen linear scores, so this
   changes no computation, but a noisy count can be negative.
 * Under-recording applies to every stand-alone 0/1 input with a prevalence below 50%. The rule cannot

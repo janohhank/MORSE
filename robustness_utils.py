@@ -9,10 +9,12 @@ picked after seeing which one favours a method. There are two kinds of stress, w
   covariate shift). Only real rows are re-emphasised, so a re-weighting can never produce an impossible
   combination of values and needs no knowledge of what the features mean.
 * CORRUPTION changes recorded values: measurement noise, recording errors of 0/1 inputs, lost records,
-  values that are not available. It does not keep P(y | observed x), and it has to keep the data valid:
-  a one-hot group keeps exactly one level, a "not available" flag keeps its fill value, a combination of
-  0/1 values that never occurs in training is not created. The rules for that are inferred from the
-  training data as well (`infer_feature_schema`).
+  values that are not available. It does not keep P(y | observed x), and it has to keep the data valid
+  by its STRUCTURAL rules: a one-hot group keeps at most one level (exactly one if it is exhaustive), a
+  "not available" flag keeps its value at the fill value. Those rules are inferred from the names and the
+  training data (`infer_feature_schema`) and checked after every corruption. A combination of 0/1 values
+  that merely never occurs in training is an association, not an impossibility: it is counted when a
+  corruption creates it, never prevented.
 """
 from __future__ import annotations
 
@@ -219,17 +221,33 @@ def calibrate_strength(ess_at: Callable[[float], float], target: float,
 @dataclass
 class ValueIndicator:
     """A 0/1 flag that marks values as not available (e.g. `ADM_RATE:missing` = 1 or `albumin:Binary` = 0).
-    Whenever `flag == off_level`, every column of `fills` holds its fill value (the imputed value)."""
+    Whenever `flag == off_level`, every column of `fills` holds its fill value (the imputed value).
+    `named` lists the values paired with the flag by their names (`albumin:Binary` / `albumin:Value`); the
+    other values of `fills` were paired statistically: values without a flag of their own that the
+    preprocessing covered with a shared flag (e.g. a census block with one `:missing` flag)."""
     flag: str
     off_level: int
     fills: dict[str, float]
+    named: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
-class ForbiddenCombination:
+class UnresolvedAvailability:
+    """A possible flag / value pair that is NOT used: proposed by the names but not confirmed by the data,
+    or a value that looks imputed on a flag level but fails the statistical rule. Reported (schema.json and
+    the report) so that a missed relationship is visible instead of silently corrupted."""
+    flag: str
+    value: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnseenCombination:
     """`a == a_value` together with `b == b_value` never occurs in the training rows although independence
-    predicts `expected` of them: treated as impossible (two levels of a one-hot group, a sex-specific
-    code, a flag that is only set together with another, ...). The corruptions never create it."""
+    predicts `expected` of them. A DIAGNOSTIC only: it is an unusual association, not proof that the
+    combination is impossible (such combinations do occur in test sets), so the corruptions may create it;
+    corruption_diagnostics.csv counts how often they do. The genuine structural rules -- one-hot groups
+    and availability pairs -- are enforced by construction instead."""
     a: str
     a_value: int
     b: str
@@ -252,15 +270,17 @@ class FeatureSchema:
     # group is exhaustive)
     family_frequencies: dict[str, list[float]]
     value_indicators: list[ValueIndicator]
-    forbidden: list[ForbiddenCombination]
     # stand-alone 0/1 inputs (not in a one-hot group, not an availability flag)
     redraw_columns: list[str]
     # the stand-alone 0/1 inputs whose 1 is the recorded event (training prevalence below the threshold)
     under_recording_columns: list[str]
     training_prevalence: dict[str, float] = field(default_factory=dict)
+    unresolved_availability: list[UnresolvedAvailability] = field(default_factory=list)
+    unseen_combinations: list[UnseenCombination] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
         """Counts, for the report."""
+        named: int = sum(len(indicator.named) for indicator in self.value_indicators)
         return {
             "inputs": len(self.features),
             "binary": len(self.binary),
@@ -271,7 +291,10 @@ class FeatureSchema:
             "one_hot_levels": sum(len(members) for members in self.dummy_families.values()),
             "availability_flags": len(self.value_indicators),
             "values_with_flag": len({c for indicator in self.value_indicators for c in indicator.fills}),
-            "forbidden_combinations": len(self.forbidden),
+            "values_paired_by_name": named,
+            "values_paired_statistically": sum(len(i.fills) for i in self.value_indicators) - named,
+            "unresolved_availability": len(self.unresolved_availability),
+            "unseen_combinations": len(self.unseen_combinations),
             "stand_alone_binary": len(self.redraw_columns),
             "under_recording_inputs": len(self.under_recording_columns),
         }
@@ -286,10 +309,14 @@ class FeatureSchema:
             "other": self.other,
             "one_hot_groups": {prefix: {"members": members, "frequencies": self.family_frequencies[prefix]}
                                for prefix, members in self.dummy_families.items()},
-            "value_indicators": [{"flag": i.flag, "off_level": i.off_level, "fills": i.fills}
+            "value_indicators": [{"flag": i.flag, "off_level": i.off_level, "fills": i.fills,
+                                  "paired_by_name": i.named,
+                                  "paired_statistically": [c for c in i.fills if c not in i.named]}
                                  for i in self.value_indicators],
-            "forbidden_combinations": [{"a": f.a, "a_value": f.a_value, "b": f.b, "b_value": f.b_value,
-                                        "expected_rows": round(f.expected, 2)} for f in self.forbidden],
+            "unresolved_availability": [{"flag": u.flag, "value": u.value, "reason": u.reason}
+                                        for u in self.unresolved_availability],
+            "unseen_combinations": [{"a": f.a, "a_value": f.a_value, "b": f.b, "b_value": f.b_value,
+                                     "expected_rows": round(f.expected, 2)} for f in self.unseen_combinations],
             "stand_alone_binary": self.redraw_columns,
             "under_recording_inputs": self.under_recording_columns,
         }
@@ -300,14 +327,24 @@ def infer_feature_schema(X_train: pandas.DataFrame, config: RobustnessConfig | N
 
     * Types: 0/1 inputs, continuous inputs (more than two distinct values), constants, and "other"
       (two values that are not 0/1; left alone by the corruptions).
-    * Value/availability pairs: a numeric input that holds ONE value on every row of one level of a 0/1
-      flag (at least `value_indicator_min_rows` rows) and that value on at most
-      `value_indicator_max_other_share` of the other rows -- an imputed value with its missing /
-      measured indicator. The flag level on which the values are constant means "not available".
+    * Value/availability pairs (an imputed value with its missing / measured indicator; the flag level on
+      which the value is constant means "not available"):
+        - by name first: a 0/1 flag `<stem><sep><suffix>` (sep one of `:_. `) and a continuous value named
+          `<stem>` or `<stem><sep><suffix>` -- e.g. `albumin:Binary` / `albumin:Value`, `ADM_RATE:missing` /
+          `ADM_RATE` -- used when the data confirm it: the value holds one value on every row of exactly
+          one level of the flag. The name is the evidence, so no share rule applies (an imputed median is
+          often a common measured value) and any number of rows suffices;
+        - statistically, for continuous values that have no flag of their own name: the value holds ONE
+          value on every row of one level of a 0/1 input (at least `value_indicator_min_rows` rows) and
+          that value on at most `value_indicator_max_other_share` of the other rows. Such a value may
+          belong to several flags (a flag shared by a block of values). A value with a flag of its own
+          belongs to that flag only.
+      Name-proposed pairs the data do not confirm, and values that look imputed but fail the statistical
+      rule, are listed as unresolved.
     * One-hot groups: 0/1 inputs named `<prefix>_<level>` (pandas' dummy encoding) with at most one of
       them equal to 1 in every training row. The name only proposes a group; the data must confirm it.
-    * Forbidden combinations: pairs of 0/1 values that never occur together although independence
-      predicts at least `structural_zero_min_expected` rows.
+    * Unseen combinations (a diagnostic): pairs of 0/1 values that never occur together although
+      independence predicts at least `unseen_combination_min_expected` rows.
     """
     config = config or RobustnessConfig()
     features: list[str] = list(X_train.columns)
@@ -332,7 +369,7 @@ def infer_feature_schema(X_train: pandas.DataFrame, config: RobustnessConfig | N
         else:
             continuous.append(name)
 
-    indicators: list[ValueIndicator] = _find_value_indicators(A, index, binary, continuous, config)
+    indicators, unresolved = _find_value_indicators(A, index, binary, continuous, config)
     flags: set[str] = {indicator.flag for indicator in indicators}
 
     candidates: dict[str, list[str]] = {}
@@ -351,8 +388,8 @@ def infer_feature_schema(X_train: pandas.DataFrame, config: RobustnessConfig | N
             counts: numpy.ndarray = block.sum(axis=0)
             frequencies[prefix] = [float(c / n) for c in counts] + [float((n - counts.sum()) / n)]
 
-    forbidden: list[ForbiddenCombination] = _find_forbidden_combinations(
-        A, index, binary, config.structural_zero_min_expected)
+    unseen: list[UnseenCombination] = _find_unseen_combinations(
+        A, index, binary, config.unseen_combination_min_expected)
     in_family: set[str] = {m for members in families.values() for m in members}
     prevalence: dict[str, float] = {name: float(A[:, index[name]].mean()) for name in binary}
     redraw: list[str] = [name for name in binary if name not in in_family and name not in flags]
@@ -361,39 +398,127 @@ def infer_feature_schema(X_train: pandas.DataFrame, config: RobustnessConfig | N
     return FeatureSchema(
         features=features, binary=binary, continuous=continuous, constant=constant, other=other,
         dummy_families=families, family_frequencies=frequencies, value_indicators=indicators,
-        forbidden=forbidden, redraw_columns=redraw, under_recording_columns=under,
-        training_prevalence=prevalence)
+        redraw_columns=redraw, under_recording_columns=under, training_prevalence=prevalence,
+        unresolved_availability=unresolved, unseen_combinations=unseen)
+
+
+# Characters that separate the parts of a column name (`albumin:Binary`, `ADM_RATE:missing`, `x.flag`).
+NAME_SEPARATORS: str = ":_. "
+
+
+def _split_name(name: str) -> tuple[str, str] | None:
+    """(stem, separator) of a name, split at its last separator: "albumin:Binary" -> ("albumin", ":"),
+    "ADM_RATE:missing" -> ("ADM_RATE", ":"), "bun_cre:Value" -> ("bun_cre", ":"); None without one."""
+    cut: int = max(name.rfind(separator) for separator in NAME_SEPARATORS)
+    return (name[:cut], name[cut]) if cut > 0 else None
+
+
+def _named_values(flag: str, continuous: list[str]) -> list[str]:
+    """The continuous inputs whose names pair them with `flag` = `<stem><sep><suffix>`: the value `<stem>`
+    itself, or a value `<stem><sep><other suffix>` with the same separator (so `ADM_RATE:missing` pairs
+    with `ADM_RATE` but not with `ADM_RATE_ALL`)."""
+    split: tuple[str, str] | None = _split_name(flag)
+    if split is None:
+        return []
+    return [value for value in continuous if value == split[0] or (value != flag and _split_name(value) == split)]
 
 
 def _find_value_indicators(A: numpy.ndarray, index: dict[str, int], binary: list[str], continuous: list[str],
-                           config: RobustnessConfig) -> list[ValueIndicator]:
-    if not continuous:
-        return []
-    C: numpy.ndarray = A[:, [index[c] for c in continuous]]
-    found: list[ValueIndicator] = []
+                           config: RobustnessConfig) -> tuple[list[ValueIndicator], list[UnresolvedAvailability]]:
+    if not continuous or not binary:
+        return [], []
+    found: dict[str, ValueIndicator] = {}
+    unresolved: list[UnresolvedAvailability] = []
+
+    # 1. pairs proposed by the names, confirmed by the data
+    named: set[str] = set()
     for flag in binary:
         x: numpy.ndarray = A[:, index[flag]]
-        best: ValueIndicator | None = None
-        for level in (0, 1):
-            rows: numpy.ndarray = x == level
-            if rows.sum() < config.value_indicator_min_rows or (~rows).sum() < config.value_indicator_min_rows:
+        for value in _named_values(flag, continuous):
+            v: numpy.ndarray = A[:, index[value]]
+            # a continuous value has more than two distinct values, so it is constant on at most one level
+            levels: list[int] = [level for level in (0, 1) if numpy.ptp(v[x == level]) == 0]
+            if not levels:
+                unresolved.append(UnresolvedAvailability(
+                    flag, value, "paired by name, but the value is not constant on either level of the flag"))
                 continue
-            inside: numpy.ndarray = C[rows]
-            outside: numpy.ndarray = C[~rows]
-            fills: dict[str, float] = {}
-            for k in numpy.flatnonzero(numpy.ptp(inside, axis=0) == 0):
-                value: float = float(inside[0, k])
-                if numpy.mean(outside[:, k] == value) <= config.value_indicator_max_other_share:
-                    fills[continuous[k]] = value
-            if fills and (best is None or len(fills) > len(best.fills)):
-                best = ValueIndicator(flag=flag, off_level=level, fills=fills)
-        if best is not None:
-            found.append(best)
-    return found
+            level: int = levels[0]
+            indicator: ValueIndicator | None = found.get(flag)
+            if indicator is None:
+                indicator = found[flag] = ValueIndicator(flag=flag, off_level=level, fills={}, named=[])
+            elif indicator.off_level != level:
+                unresolved.append(UnresolvedAvailability(
+                    flag, value, f"paired by name, but constant on flag level {level} while the flag's other "
+                                 f"values are constant on level {indicator.off_level}"))
+                continue
+            indicator.fills[value] = float(v[x == level][0])
+            indicator.named.append(value)
+            named.add(value)
+
+    # 2. values without a flag of their own name, statistically:
+    #    rule S (any 0/1 input as the flag): one value on every row of a flag level and on at most
+    #           `value_indicator_max_other_share` of the other rows;
+    #    rule B (a flag confirmed by name, i.e. a known availability flag shared by a block of values):
+    #           one value strictly inside the value's range (an imputed centre, not a structural zero at
+    #           the boundary) on all k rows of the flag's off level, where a share s of the other rows
+    #           holds it too -- k chance matches have probability s^k <= `value_indicator_max_chance`.
+    #    Missingness is often nested (no faculty data => no SAT scores either), so several flags can claim
+    #    one value; it belongs to the claiming flag with the most off rows -- the one that explains its
+    #    imputation -- or to all of them on a tie (with one fill value).
+    remaining: list[str] = [c for c in continuous if c not in named]
+    if remaining:
+        C: numpy.ndarray = A[:, [index[c] for c in remaining]]
+        low: numpy.ndarray = C.min(axis=0)
+        high: numpy.ndarray = C.max(axis=0)
+        near_miss: dict[str, UnresolvedAvailability] = {}
+        claims: dict[str, list[tuple[int, str, int, float]]] = {}      # value -> (off rows, flag, level, fill)
+        for flag in binary:
+            x = A[:, index[flag]]
+            confirmed: ValueIndicator | None = found.get(flag)
+            best: tuple[int, dict[str, float], int] | None = None
+            for level in ((confirmed.off_level,) if confirmed is not None else (0, 1)):
+                rows: numpy.ndarray = x == level
+                n_rows: int = int(rows.sum())
+                if n_rows < config.value_indicator_min_rows or (~rows).sum() < config.value_indicator_min_rows:
+                    continue
+                inside: numpy.ndarray = C[rows]
+                outside: numpy.ndarray = C[~rows]
+                fills: dict[str, float] = {}
+                for k in numpy.flatnonzero(numpy.ptp(inside, axis=0) == 0):
+                    fill: float = float(inside[0, k])
+                    share: float = float(numpy.mean(outside[:, k] == fill))
+                    if share <= config.value_indicator_max_other_share:
+                        fills[remaining[k]] = fill
+                    elif confirmed is not None and low[k] < fill < high[k]:
+                        if share ** n_rows <= config.value_indicator_max_chance:
+                            fills[remaining[k]] = fill
+                        elif remaining[k] not in near_miss:
+                            near_miss[remaining[k]] = UnresolvedAvailability(
+                                flag, remaining[k], f"holds {fill:g} on all {n_rows} rows where {flag} says 'not "
+                                                    f"available', but also on {share:.0%} of the other rows, so "
+                                                    f"this can be chance")
+                if fills and (best is None or len(fills) > len(best[1])):
+                    best = (level, fills, n_rows)
+            if best is not None:
+                for value, fill in best[1].items():
+                    claims.setdefault(value, []).append((best[2], flag, best[0], fill))
+        for value, options in claims.items():
+            largest: int = max(option[0] for option in options)
+            winners: list[tuple[int, str, int, float]] = [option for option in options if option[0] == largest]
+            for _, flag, level, fill in winners:
+                if fill != winners[0][3]:
+                    continue                                 # one fill value per value
+                indicator = found.get(flag)
+                if indicator is None:
+                    indicator = found[flag] = ValueIndicator(flag=flag, off_level=level, fills={}, named=[])
+                indicator.fills[value] = fill
+        paired: set[str] = {value for indicator in found.values() for value in indicator.fills}
+        unresolved.extend(entry for value, entry in near_miss.items() if value not in paired)
+    return [found[flag] for flag in binary if flag in found], unresolved
 
 
-def _find_forbidden_combinations(A: numpy.ndarray, index: dict[str, int], binary: list[str],
-                                 min_expected: float) -> list[ForbiddenCombination]:
+def _find_unseen_combinations(A: numpy.ndarray, index: dict[str, int], binary: list[str],
+                              min_expected: float) -> list[UnseenCombination]:
     if len(binary) < 2:
         return []
     B: numpy.ndarray = A[:, [index[c] for c in binary]]
@@ -408,12 +533,12 @@ def _find_forbidden_combinations(A: numpy.ndarray, index: dict[str, int], binary
     }
     share: dict[int, numpy.ndarray] = {1: ones / n, 0: 1.0 - ones / n}
     upper: numpy.ndarray = numpy.triu(numpy.ones((len(binary), len(binary)), dtype=bool), k=1)
-    found: list[ForbiddenCombination] = []
+    found: list[UnseenCombination] = []
     for (u, v), count in counts.items():
         expected: numpy.ndarray = n * numpy.outer(share[u], share[v])
         hit: numpy.ndarray = upper & (numpy.rint(count) == 0) & (expected >= min_expected)
         for i, j in zip(*numpy.nonzero(hit)):
-            found.append(ForbiddenCombination(binary[i], u, binary[j], v, float(expected[i, j])))
+            found.append(UnseenCombination(binary[i], u, binary[j], v, float(expected[i, j])))
     return found
 
 
@@ -706,11 +831,14 @@ class CorruptionBank:
                       is re-drawn from its training distribution with probability `level`.
       under_recording every recorded 1 of a stand-alone 0/1 input with training prevalence below the
                       threshold is lost (set to 0) with probability `level`.
-      value_masking   every available value with an availability flag becomes "not available" (flag set
-                      to its off level, values to their fill values) with probability `level`; a flag
-                      that is only ever off together with another one takes that one with it.
-    After every corruption, a change that created a combination of 0/1 values that never occurs in
-    training (`FeatureSchema.forbidden`) is undone for that row.
+      value_masking   every available value with an availability flag becomes "not available" (the flag
+                      set to its off level, its values to their fill values) with probability `level`, each
+                      flag independently: at level 1 every value is withheld.
+    Availability flags are never re-drawn or under-recorded, so a flag and its values always agree. The
+    structural rules (one-hot groups, availability pairs, 0/1 values) are checked after every corruption
+    (a violation raises RuntimeError). A combination of 0/1 values that never occurs in training
+    (`FeatureSchema.unseen_combinations`) may be created -- it is an association, not an impossibility --
+    and is counted in the diagnostics of every corrupted test set.
     """
 
     def __init__(self, schema: FeatureSchema, X_train: pandas.DataFrame, X_test: pandas.DataFrame,
@@ -734,13 +862,17 @@ class CorruptionBank:
 
         # -- recording noise: one-hot groups first, then stand-alone inputs
         self._redraw_units: list[_Unit] = []
+        self._exhaustive_groups: list[numpy.ndarray] = []
+        self._groups: list[numpy.ndarray] = []
         for prefix, members in schema.dummy_families.items():
             frequencies: numpy.ndarray = numpy.asarray(schema.family_frequencies[prefix], dtype=float)
+            columns: numpy.ndarray = numpy.array([column[m] for m in members])
+            self._groups.append(columns)
             if frequencies[-1] <= 0.0:                  # exhaustive group: never "none of them"
                 frequencies = frequencies[:-1]
+                self._exhaustive_groups.append(columns)
             cumulative: numpy.ndarray = numpy.cumsum(frequencies / frequencies.sum())[:-1]
-            self._redraw_units.append(_Unit(columns=numpy.array([column[m] for m in members]),
-                                            cumulative=cumulative))
+            self._redraw_units.append(_Unit(columns=columns, cumulative=cumulative))
         for name in schema.redraw_columns:
             self._redraw_units.append(_Unit(columns=numpy.array([column[name]]),
                                             prevalence=schema.training_prevalence[name]))
@@ -749,7 +881,7 @@ class CorruptionBank:
         self._under_units: list[_Unit] = [_Unit(columns=numpy.array([column[name]]))
                                           for name in schema.under_recording_columns]
 
-        # -- value masking
+        # -- value masking: one unit per availability flag, with its values
         self._mask_units: list[_Unit] = []
         for indicator in schema.value_indicators:
             values: list[str] = list(indicator.fills)
@@ -759,25 +891,20 @@ class CorruptionBank:
                 flag=column[indicator.flag], off_level=int(indicator.off_level),
                 value_columns=value_columns,
                 fills=numpy.array([indicator.fills[v] for v in values], dtype=float)))
-        # a flag that is never off while another one is on: masking the first masks the second too
-        unit_of_flag: dict[int, int] = {unit.flag: k for k, unit in enumerate(self._mask_units)}
-        implications: set[tuple[int, int]] = set()
-        for combination in schema.forbidden:
-            for (x, x_value), (y, y_value) in (((combination.a, combination.a_value), (combination.b, combination.b_value)),
-                                               ((combination.b, combination.b_value), (combination.a, combination.a_value))):
-                kx, ky = unit_of_flag.get(column[x]), unit_of_flag.get(column[y])
-                if kx is None or ky is None:
-                    continue
-                if x_value == self._mask_units[kx].off_level and y_value != self._mask_units[ky].off_level:
-                    implications.add((kx, ky))
-        self._mask_implications: list[tuple[int, int]] = sorted(implications)
 
-        # -- forbidden combinations, in column indices, and whether a clean row already has them
-        self._forbidden: numpy.ndarray = numpy.array(
-            [[column[f.a], f.a_value, column[f.b], f.b_value] for f in schema.forbidden], dtype=int
+        # -- validity checks: 0/1 inputs, and the availability rule on the clean rows (a test row that
+        # already breaks it, e.g. imputed differently, is left as it is and not counted as a violation)
+        self._binary_columns: numpy.ndarray = numpy.array([column[c] for c in schema.binary], dtype=int)
+        self._clean_violations: list[numpy.ndarray] = [self._availability_violations(self._clean, unit)
+                                                       for unit in self._mask_units]
+        self.clean_availability_violations: int = int(sum(v.sum() for v in self._clean_violations))
+
+        # -- unseen combinations (diagnostic), in column indices, and whether a clean row already has them
+        self._unseen: numpy.ndarray = numpy.array(
+            [[column[f.a], f.a_value, column[f.b], f.b_value] for f in schema.unseen_combinations], dtype=int
         ).reshape(-1, 4)
-        if self._forbidden.size:
-            fa, fu, fb, fv = self._forbidden.T
+        if self._unseen.size:
+            fa, fu, fb, fv = self._unseen.T
             self._clean_has: numpy.ndarray = (self._clean[:, fa] == fu) & (self._clean[:, fb] == fv)
         else:
             self._clean_has = numpy.zeros((n_rows, 0), dtype=bool)
@@ -831,8 +958,9 @@ class CorruptionBank:
     # ---- corrupted data ---------------------------------------------------------------------------------
     def corrupt(self, family: str, level: float, repetition: int) -> tuple[pandas.DataFrame, dict[str, int]]:
         """The test set under `family` at `level` in the given repetition, and counts of what changed:
-        `eligible` cells (or units), `selected` by the random draw, `changed` in the end, and `reverted`
-        because the change created a forbidden combination."""
+        `eligible` cells (or units), `selected` by the random draw, `changed` in the end, and the
+        combinations of 0/1 values unseen in training that the corruption created
+        (`unseen_combinations`, in `rows_with_unseen_combination` rows)."""
         if not 0.0 <= level <= 1.0:
             raise ValueError(f"level must lie in [0, 1], got {level}")
         draws: dict[str, numpy.ndarray] = self._draw(family, repetition)
@@ -845,6 +973,8 @@ class CorruptionBank:
             counts = self._under_record(X, level, draws)
         else:
             counts = self._mask(X, level, draws)
+        self._check(X, family, level)
+        counts.update(self._unseen_created(X))
         return pandas.DataFrame(X, columns=self._features, index=self._index), counts
 
     def _gaussian(self, X: numpy.ndarray, level: float, draws: dict[str, numpy.ndarray]) -> dict[str, int]:
@@ -853,11 +983,11 @@ class CorruptionBank:
         noise: numpy.ndarray = level * draws["z"] * self._noise_scale[None, :]
         X[:, columns] += numpy.where(available, noise, 0.0)
         changed: int = int((available & (noise != 0.0)).sum())
-        return {"eligible": int(available.sum()), "selected": changed, "changed": changed, "reverted": 0}
+        return {"eligible": int(available.sum()), "selected": changed, "changed": changed}
 
     def _redraw(self, X: numpy.ndarray, level: float, draws: dict[str, numpy.ndarray]) -> dict[str, int]:
         select: numpy.ndarray = draws["select"] < level
-        changed: numpy.ndarray = numpy.zeros_like(select)
+        changed: int = 0
         for k, unit in enumerate(self._redraw_units):
             rows: numpy.ndarray = numpy.flatnonzero(select[:, k])
             if rows.size == 0:
@@ -872,90 +1002,63 @@ class CorruptionBank:
             else:
                 new = (u < unit.prevalence).astype(float)[:, None]
             X[numpy.ix_(rows, unit.columns)] = new
-            changed[rows, k] = (new != old).any(axis=1)
-        reverted: int = self._repair(X, self._redraw_units, changed, draws["select"])
-        return {"eligible": int(select.size), "selected": int(select.sum()), "changed": int(changed.sum()),
-                "reverted": reverted}
+            changed += int((new != old).any(axis=1).sum())
+        return {"eligible": int(select.size), "selected": int(select.sum()), "changed": changed}
 
     def _under_record(self, X: numpy.ndarray, level: float, draws: dict[str, numpy.ndarray]) -> dict[str, int]:
         columns: numpy.ndarray = numpy.array([unit.columns[0] for unit in self._under_units], dtype=int)
         recorded: numpy.ndarray = X[:, columns] == 1.0
         lost: numpy.ndarray = recorded & (draws["select"] < level)
         X[:, columns] = numpy.where(lost, 0.0, X[:, columns])
-        changed: numpy.ndarray = lost.copy()
-        reverted: int = self._repair(X, self._under_units, changed, draws["select"])
-        return {"eligible": int(recorded.sum()), "selected": int(lost.sum()), "changed": int(changed.sum()),
-                "reverted": reverted}
+        return {"eligible": int(recorded.sum()), "selected": int(lost.sum()), "changed": int(lost.sum())}
 
     def _mask(self, X: numpy.ndarray, level: float, draws: dict[str, numpy.ndarray]) -> dict[str, int]:
         flags: numpy.ndarray = numpy.array([unit.flag for unit in self._mask_units], dtype=int)
         off: numpy.ndarray = numpy.array([unit.off_level for unit in self._mask_units], dtype=float)
         available: numpy.ndarray = X[:, flags] != off[None, :]
         select: numpy.ndarray = available & (draws["select"] < level)
-        selected: int = int(select.sum())
-        # rank = the level at which a unit enters: its own draw, or that of the unit that takes it along
-        rank: numpy.ndarray = numpy.where(select, draws["select"], numpy.inf)
-        for _ in range(len(self._mask_units)):              # take the implied flags along
-            grown: numpy.ndarray = rank.copy()
-            for source, target in self._mask_implications:
-                grown[:, target] = numpy.where(available[:, target],
-                                               numpy.minimum(grown[:, target], rank[:, source]), grown[:, target])
-            if numpy.array_equal(grown, rank):
-                break
-            rank = grown
-        select = numpy.isfinite(rank)
         for k, unit in enumerate(self._mask_units):
             rows: numpy.ndarray = numpy.flatnonzero(select[:, k])
             if rows.size:
                 X[rows, unit.flag] = unit.off_level
                 X[numpy.ix_(rows, unit.value_columns)] = unit.fills[None, :]
-        changed: numpy.ndarray = select.copy()
-        reverted: int = self._repair(X, self._mask_units, changed, rank)
-        if reverted:
-            # a value can belong to several flags: restoring one unit must not undo another one's fill
-            for k, unit in enumerate(self._mask_units):
-                rows = numpy.flatnonzero(changed[:, k])
-                if rows.size:
-                    X[numpy.ix_(rows, unit.value_columns)] = unit.fills[None, :]
-        return {"eligible": int(available.sum()), "selected": selected, "changed": int(changed.sum()),
-                "reverted": reverted}
+        return {"eligible": int(available.sum()), "selected": int(select.sum()), "changed": int(select.sum())}
 
-    def _repair(self, X: numpy.ndarray, units: list[_Unit], changed: numpy.ndarray, rank: numpy.ndarray) -> int:
-        """Undo changes that created a forbidden combination the clean row does not have. In each such
-        conflict only the JUNIOR changed unit is undone -- the one with the larger `rank`, i.e. the one
-        that enters at the higher level (both on a tie) -- so a change present at one level is never
-        undone at a higher level: the corrupted cells stay nested across the levels. Returns the number
-        of (row, unit) changes undone."""
-        if not self._forbidden.size or not changed.any():
-            return 0
-        fa, fu, fb, fv = self._forbidden.T
-        unit_of_column: numpy.ndarray = numpy.full(X.shape[1], -1, dtype=int)
-        for k, unit in enumerate(units):
-            binary_columns: numpy.ndarray = unit.columns if unit.flag < 0 else numpy.array([unit.flag])
-            unit_of_column[binary_columns] = k
-        reverted: int = 0
-        for _ in range(1000):
-            violation: numpy.ndarray = (X[:, fa] == fu) & (X[:, fb] == fv) & ~self._clean_has
-            if not violation.any():
-                break
-            rows, combinations = numpy.nonzero(violation)
-            units_a: numpy.ndarray = unit_of_column[fa[combinations]]
-            units_b: numpy.ndarray = unit_of_column[fb[combinations]]
-            changed_a: numpy.ndarray = (units_a >= 0) & changed[rows, numpy.maximum(units_a, 0)]
-            changed_b: numpy.ndarray = (units_b >= 0) & changed[rows, numpy.maximum(units_b, 0)]
-            rank_a: numpy.ndarray = numpy.where(changed_a, rank[rows, numpy.maximum(units_a, 0)], -numpy.inf)
-            rank_b: numpy.ndarray = numpy.where(changed_b, rank[rows, numpy.maximum(units_b, 0)], -numpy.inf)
-            undo_a: numpy.ndarray = changed_a & (rank_a >= rank_b)
-            undo_b: numpy.ndarray = changed_b & (rank_b >= rank_a)
-            undo: numpy.ndarray = numpy.unique(numpy.vstack([
-                numpy.column_stack([rows[undo_a], units_a[undo_a]]),
-                numpy.column_stack([rows[undo_b], units_b[undo_b]])]), axis=0)
-            if undo.size == 0:
-                break
-            for k in numpy.unique(undo[:, 1]):
-                unit_rows: numpy.ndarray = undo[undo[:, 1] == k, 0]
-                columns = units[k].columns
-                X[numpy.ix_(unit_rows, columns)] = self._clean[numpy.ix_(unit_rows, columns)]
-                changed[unit_rows, k] = False
-            reverted += int(undo.shape[0])
-        return reverted
+    # ---- validity and diagnostics ---------------------------------------------------------------------------
+    @staticmethod
+    def _availability_violations(X: numpy.ndarray, unit: _Unit) -> numpy.ndarray:
+        """(rows x values) cells whose flag says "not available" but which do not hold the fill value."""
+        off_rows: numpy.ndarray = X[:, unit.flag] == unit.off_level
+        return off_rows[:, None] & (X[:, unit.value_columns] != unit.fills[None, :])
+
+    def _check(self, X: numpy.ndarray, family: str, level: float) -> None:
+        """The structural rules: 0/1 inputs stay 0/1; a one-hot group keeps at most one level (exactly one
+        if it is exhaustive and the clean row had one); a value whose flag says "not available" holds its
+        fill value (unless the clean test row already broke that rule and the cell is unchanged)."""
+        problems: list[str] = []
+        binary: numpy.ndarray = X[:, self._binary_columns]
+        if not numpy.isin(binary, (0.0, 1.0)).all():
+            problems.append("a 0/1 input holds another value")
+        for columns in self._groups:
+            if (X[:, columns].sum(axis=1) > 1).any():
+                problems.append("a one-hot group has two levels in a row")
+        for columns in self._exhaustive_groups:
+            if ((X[:, columns].sum(axis=1) != 1) & (self._clean[:, columns].sum(axis=1) == 1)).any():
+                problems.append("an exhaustive one-hot group lost its level")
+        for unit, clean_violation in zip(self._mask_units, self._clean_violations):
+            violation: numpy.ndarray = self._availability_violations(X, unit)
+            unchanged: numpy.ndarray = X[:, unit.value_columns] == self._clean[:, unit.value_columns]
+            if (violation & ~(clean_violation & unchanged)).any():
+                problems.append(f"a value of the availability flag {self._features[unit.flag]!r} is not at "
+                                f"its fill value")
+        if problems:
+            raise RuntimeError(f"{family} at level {level} broke the structural rules of the data: "
+                               + "; ".join(dict.fromkeys(problems)))
+
+    def _unseen_created(self, X: numpy.ndarray) -> dict[str, int]:
+        if not self._unseen.size:
+            return {"unseen_combinations": 0, "rows_with_unseen_combination": 0}
+        fa, fu, fb, fv = self._unseen.T
+        created: numpy.ndarray = (X[:, fa] == fu) & (X[:, fb] == fv) & ~self._clean_has
+        return {"unseen_combinations": int(created.sum()),
+                "rows_with_unseen_combination": int(created.any(axis=1).sum())}

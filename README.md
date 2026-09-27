@@ -139,7 +139,7 @@ data through its official access pathway and add a matching config block.
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
 | `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), and `find_balanced_threshold`. The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
 | `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
-| `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with availability flags, forbidden 0/1 combinations — from the training rows), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
+| `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
 | `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
 | `legacy_stress_evaluation` | `run_legacy_stress_grid`: the robustness evaluation of runs made before the suite (Gaussian noise × PC1 covariate-shift grid, 0/1 re-draw noise, AURS), unchanged — it reproduces those runs' CSVs byte for byte — as an optional notebook block and as `python legacy_stress_evaluation.py --run <result folder>`. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
@@ -351,8 +351,11 @@ corresponding code cells:
     random numbers, independent of the GA seed): measurement noise, recording
     noise of 0/1 inputs (one-hot groups re-drawn as one input),
     under-recording, and values that become "not available". The corruptions
-    never create a combination of 0/1 values that is impossible in the
-    training data;
+    keep the structure of the data — one-hot groups stay valid, availability
+    flags (paired with their values by name first) are never re-drawn, and a
+    value whose flag says "not available" keeps its fill value — which is
+    checked after every corruption; combinations of 0/1 values merely never
+    seen in training are counted as a diagnostic, not prevented;
   - per family and severity: the stressed score and its change from each
     model's clean score, MORSE against every baseline (paired Wilcoxon tests
     over the seeds), an exploratory sign-consistency-vs-degradation analysis,

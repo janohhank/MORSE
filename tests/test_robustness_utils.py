@@ -149,13 +149,15 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(len(self.schema.value_indicators), 1)
         indicator = self.schema.value_indicators[0]
         self.assertEqual((indicator.flag, indicator.off_level, indicator.fills), ("lab_measured", 0, {"lab": FILL}))
+        self.assertEqual(indicator.named, ["lab"])                     # `lab_measured` names `lab`
+        self.assertEqual(self.schema.unresolved_availability, [])
 
-    def test_forbidden_combinations(self):
-        forbidden = {(f.a, f.a_value, f.b, f.b_value) for f in self.schema.forbidden}
-        self.assertTrue(("general", 0, "specific", 1) in forbidden or ("specific", 1, "general", 0) in forbidden)
-        self.assertTrue(("female", 1, "male_code", 1) in forbidden or ("male_code", 1, "female", 1) in forbidden)
-        self.assertTrue(("state_A", 1, "state_B", 1) in forbidden)
-        self.assertFalse(any({f[0], f[2]} == {"med_a", "med_b"} for f in forbidden))
+    def test_unseen_combinations_are_found_as_a_diagnostic(self):
+        unseen = {(f.a, f.a_value, f.b, f.b_value) for f in self.schema.unseen_combinations}
+        self.assertTrue(("general", 0, "specific", 1) in unseen or ("specific", 1, "general", 0) in unseen)
+        self.assertTrue(("female", 1, "male_code", 1) in unseen or ("male_code", 1, "female", 1) in unseen)
+        self.assertTrue(("state_A", 1, "state_B", 1) in unseen)
+        self.assertFalse(any({f[0], f[2]} == {"med_a", "med_b"} for f in unseen))
 
     def test_stand_alone_and_under_recording_inputs(self):
         self.assertEqual(set(self.schema.redraw_columns),
@@ -261,15 +263,20 @@ class CorruptionTests(unittest.TestCase):
         self.assertFalse(first.equals(second))
         pandas.testing.assert_frame_equal(first, again)
 
-    def test_redraw_keeps_the_data_valid(self):
+    def test_redraw_keeps_the_structure_and_counts_unseen_combinations(self):
         clean = self.X_test
         corrupted, counts = self.bank.corrupt("binary_redraw", 1.0, 0)
         self.assertTrue((corrupted[["state_A", "state_B", "state_C"]].sum(axis=1) == 1).all())
         self.assertTrue((corrupted[["region_N", "region_S"]].sum(axis=1) <= 1).all())
-        for (a, u, b, v) in (("specific", 1, "general", 0), ("female", 1, "male_code", 1)):
-            created = ((corrupted[a] == u) & (corrupted[b] == v)) & ~((clean[a] == u) & (clean[b] == v))
-            self.assertFalse(created.any(), (a, b))
-        self.assertGreater(counts["reverted"], 0)
+        # a combination never seen in training is an association, not an impossibility: the re-draw of
+        # independent inputs creates it, and the diagnostics count it
+        created = (corrupted["specific"] == 1) & (corrupted["general"] == 0) & ~(
+            (clean["specific"] == 1) & (clean["general"] == 0))
+        self.assertTrue(created.any())
+        self.assertGreater(counts["unseen_combinations"], 0)
+        self.assertGreaterEqual(counts["unseen_combinations"], counts["rows_with_unseen_combination"])
+        self.assertGreater(counts["rows_with_unseen_combination"], 0)
+        self.assertEqual(self.bank.corrupt("binary_redraw", 0.0, 0)[1]["unseen_combinations"], 0)
         # the availability flag and the continuous inputs are not touched by the re-draw
         pandas.testing.assert_series_equal(corrupted["lab_measured"], clean["lab_measured"].astype(float))
         pandas.testing.assert_series_equal(corrupted["x1"], clean["x1"].astype(float))
@@ -285,9 +292,12 @@ class CorruptionTests(unittest.TestCase):
 
     def test_value_masking_and_noise_respect_availability(self):
         clean = self.X_test.astype(float)
-        masked, _ = self.bank.corrupt("value_masking", 1.0, 0)
+        masked, counts = self.bank.corrupt("value_masking", 1.0, 0)
         self.assertTrue((masked["lab_measured"] == 0).all())
         self.assertTrue((masked["lab"] == FILL).all())
+        # level 1 withholds every available value: nothing is undone
+        self.assertEqual(counts["changed"], counts["eligible"])
+        self.assertEqual(counts["eligible"], int((clean["lab_measured"] == 1).sum()))
         noisy, _ = self.bank.corrupt("gaussian_noise", 1.0, 0)
         unavailable = clean["lab_measured"] == 0
         self.assertTrue((noisy.loc[unavailable, "lab"] == FILL).all())
@@ -370,21 +380,26 @@ class SchemaEdgeCaseTests(unittest.TestCase):
         schema = infer_feature_schema(frame)
         self.assertEqual((schema.constant, schema.other, schema.binary, schema.continuous),
                          (["const"], ["two"], ["flag"], []))
-        # no continuous input: no value/availability pairs; a single 0/1 input: no forbidden combinations
-        self.assertEqual((schema.value_indicators, schema.forbidden), ([], []))
+        # no continuous input: no value/availability pairs; a single 0/1 input: no unseen combinations
+        self.assertEqual((schema.value_indicators, schema.unseen_combinations), ([], []))
         summary = schema.summary()
         self.assertEqual((summary["constant"], summary["other"], summary["binary"]), (1, 1, 1))
         self.assertEqual(set(schema.to_dict()), {"summary", "binary", "continuous", "constant", "other",
-                                                 "one_hot_groups", "value_indicators", "forbidden_combinations",
-                                                 "stand_alone_binary", "under_recording_inputs"})
+                                                 "one_hot_groups", "value_indicators", "unresolved_availability",
+                                                 "unseen_combinations", "stand_alone_binary",
+                                                 "under_recording_inputs"})
 
-    def test_a_flag_level_with_too_few_rows_is_no_availability_flag(self):
+    def test_a_flag_level_with_too_few_rows_is_no_statistical_availability_flag(self):
         rng = numpy.random.default_rng(4)
         flag = numpy.zeros(300, dtype=int)
         flag[:5] = 1                                              # 5 rows < value_indicator_min_rows
         value = numpy.where(flag == 1, 9.0, rng.normal(size=300))
         schema = infer_feature_schema(pandas.DataFrame({"value": value, "flag": flag}))
         self.assertEqual(schema.value_indicators, [])
+        # ... but the same flag named after its value is paired: the name is the evidence
+        schema = infer_feature_schema(pandas.DataFrame({"value": value, "value:missing": flag}))
+        self.assertEqual([(i.flag, i.off_level, i.fills) for i in schema.value_indicators],
+                         [("value:missing", 1, {"value": 9.0})])
 
     def test_dependence_pairs_need_two_inputs_and_enough_rows(self):
         rng = numpy.random.default_rng(5)
@@ -439,6 +454,10 @@ class CorruptionBankErrorTests(unittest.TestCase):
 
 
 class LinkedAvailabilityTests(unittest.TestCase):
+    """Two values with linked availability flags, like College Scorecard's admission rates. Each flag is
+    masked on its own: "flag off => fill value" always holds, and a combination never seen in training
+    (rate_all withheld while rate is reported) is counted, not prevented."""
+
     @classmethod
     def setUpClass(cls):
         cls.X = make_availability_data(3000, seed=14)
@@ -446,37 +465,36 @@ class LinkedAvailabilityTests(unittest.TestCase):
         cls.schema = infer_feature_schema(cls.X)
         cls.bank = CorruptionBank(cls.schema, cls.X, cls.X_test, repetitions=2, seed=3)
 
-    def test_the_schema_finds_both_flags_and_their_links(self):
-        indicators = {i.flag: (i.off_level, i.fills) for i in self.schema.value_indicators}
-        self.assertEqual(indicators, {"rate:missing": (1, {"rate": 0.75}), "rate_all:missing": (1, {"rate_all": 0.5})})
-        forbidden = {(f.a, f.a_value, f.b, f.b_value) for f in self.schema.forbidden}
-        self.assertIn(("rate:missing", 0, "rate_all:missing", 1), forbidden)     # rate_all missing => rate missing
-        self.assertIn(("rate:missing", 1, "reports_rate", 1), forbidden)          # reported => not missing
+    def test_every_flag_is_paired_with_its_own_value_by_name(self):
+        indicators = {i.flag: (i.off_level, i.fills, i.named) for i in self.schema.value_indicators}
+        self.assertEqual(indicators, {"rate:missing": (1, {"rate": 0.75}, ["rate"]),
+                                      "rate_all:missing": (1, {"rate_all": 0.5}, ["rate_all"])})
+        unseen = {(f.a, f.a_value, f.b, f.b_value) for f in self.schema.unseen_combinations}
+        self.assertIn(("rate:missing", 0, "rate_all:missing", 1), unseen)     # rate_all missing => rate missing
+        self.assertIn(("rate:missing", 1, "reports_rate", 1), unseen)          # reported => not missing
 
     def check_valid(self, corrupted: pandas.DataFrame) -> None:
-        self.assertFalse(((corrupted["rate_all:missing"] == 1) & (corrupted["rate:missing"] == 0)).any())
-        self.assertFalse(((corrupted["rate:missing"] == 1) & (corrupted["reports_rate"] == 1)).any())
         self.assertTrue((corrupted.loc[corrupted["rate:missing"] == 1, "rate"] == 0.75).all())
         self.assertTrue((corrupted.loc[corrupted["rate_all:missing"] == 1, "rate_all"] == 0.5).all())
 
-    def test_masking_takes_the_implied_flag_along_and_never_creates_impossible_rows(self):
+    def test_each_flag_is_masked_on_its_own_and_level_one_withholds_every_value(self):
         for level in (0.3, 0.6, 1.0):
             for repetition in (0, 1):
                 corrupted, counts = self.bank.corrupt("value_masking", level, repetition)
                 self.check_valid(corrupted)
-                self.assertGreater(counts["reverted"], 0)
-        full, _ = self.bank.corrupt("value_masking", 1.0, 0)
-        reported = self.X_test["reports_rate"] == 1
-        # every row that does not report the rate loses both values; rows that report it keep them
-        self.assertTrue((full.loc[~reported, ["rate:missing", "rate_all:missing"]] == 1).all().all())
-        pandas.testing.assert_frame_equal(full.loc[reported], self.X_test.loc[reported].astype(float))
+                self.assertEqual(counts["changed"], counts["selected"])
+        full, counts = self.bank.corrupt("value_masking", 1.0, 0)
+        self.assertEqual(counts["changed"], counts["eligible"])
+        self.assertTrue((full[["rate:missing", "rate_all:missing"]] == 1).all().all())
+        self.assertTrue(((full["rate"] == 0.75) & (full["rate_all"] == 0.5)).all())
 
-    def test_a_masked_rate_all_always_masks_the_rate_in_the_same_row(self):
+    def test_an_unseen_combination_is_created_and_counted(self):
         clean = self.X_test
-        corrupted, _ = self.bank.corrupt("value_masking", 0.4, 0)
-        newly_all = (corrupted["rate_all:missing"] == 1) & (clean["rate_all:missing"] == 0)
-        self.assertTrue(newly_all.any())
-        self.assertTrue((corrupted.loc[newly_all, "rate:missing"] == 1).all())
+        corrupted, counts = self.bank.corrupt("value_masking", 0.4, 0)
+        created = (corrupted["rate_all:missing"] == 1) & (corrupted["rate:missing"] == 0)
+        self.assertTrue(created.any())
+        self.assertFalse(((clean["rate_all:missing"] == 1) & (clean["rate:missing"] == 0)).any())
+        self.assertGreaterEqual(counts["rows_with_unseen_combination"], int(created.sum()))
 
     def test_masked_cells_stay_nested_across_levels(self):
         clean = self.X_test.astype(float)
@@ -486,6 +504,133 @@ class LinkedAvailabilityTests(unittest.TestCase):
             if previous is not None:
                 self.assertFalse((previous & ~changed).any(), level)
             previous = changed
+
+
+def indicators_of(frame: pandas.DataFrame) -> dict[str, tuple[int, dict[str, float], list[str]]]:
+    return {i.flag: (i.off_level, i.fills, i.named) for i in infer_feature_schema(frame).value_indicators}
+
+
+class AvailabilityPairingTests(unittest.TestCase):
+    """The pairing of values with their availability flags (review point 1 on RadFusion and College
+    Scorecard): by name first, then the statistical rules for values without a flag of their own."""
+
+    def test_a_median_fill_that_is_also_a_common_measured_value_is_paired_by_name(self):
+        rng = numpy.random.default_rng(21)
+        measured = rng.random(2000) < 0.6
+        # like RadFusion's sodium: the fill 136 is the median AND 30% of the measured values
+        sodium = numpy.where(measured, rng.choice([134.0, 135.0, 136.0, 137.0, 138.0], 2000,
+                                                  p=[0.15, 0.2, 0.3, 0.2, 0.15]), 136.0)
+        frame = pandas.DataFrame({"sodium:Value": sodium, "sodium:Binary": measured.astype(int)})
+        self.assertEqual(indicators_of(frame), {"sodium:Binary": (0, {"sodium:Value": 136.0}, ["sodium:Value"])})
+        # the statistical rule alone misses it -- the failure the names fix -- and says nothing about it
+        renamed = frame.rename(columns={"sodium:Binary": "flag"})
+        self.assertEqual(indicators_of(renamed), {})
+        self.assertEqual(infer_feature_schema(renamed).unresolved_availability, [])
+
+    def test_a_value_with_its_own_flag_is_not_claimed_by_another_flag(self):
+        rng = numpy.random.default_rng(22)
+        measured = rng.random(2000) < 0.7                       # INR and PTT are measured together
+        inr = numpy.where(measured, numpy.round(rng.normal(1.1, 0.1, 2000), 1), 1.1)
+        ptt = numpy.where(measured, rng.normal(30.0, 4.0, 2000), 14.2)
+        frame = pandas.DataFrame({"inr:Binary": measured.astype(int), "inr:Value": inr,
+                                  "ptt:Binary": measured.astype(int), "ptt:Value": ptt})
+        # ptt:Value is constant on inr:Binary = 0 too, and inr's fill is common: the old rule paired
+        # inr:Binary with ptt:Value and left inr:Value unpaired
+        self.assertEqual(indicators_of(frame), {"inr:Binary": (0, {"inr:Value": 1.1}, ["inr:Value"]),
+                                                "ptt:Binary": (0, {"ptt:Value": 14.2}, ["ptt:Value"])})
+
+    def test_the_name_rule_needs_the_same_separator(self):
+        rng = numpy.random.default_rng(23)
+        missing = rng.random(1000) < 0.3
+        frame = pandas.DataFrame({"rate:missing": missing.astype(int),
+                                  "rate": numpy.where(missing, 0.7, rng.uniform(0, 1, 1000)),
+                                  "rate_all": rng.uniform(0, 1, 1000)})           # not governed by the flag
+        schema = infer_feature_schema(frame)
+        self.assertEqual([(i.flag, i.fills) for i in schema.value_indicators], [("rate:missing", {"rate": 0.7})])
+        self.assertEqual(schema.unresolved_availability, [])                    # rate_all was never proposed
+
+    def test_a_pair_the_data_do_not_confirm_is_reported(self):
+        rng = numpy.random.default_rng(24)
+        frame = pandas.DataFrame({"x": rng.normal(size=500), "x:missing": (rng.random(500) < 0.2).astype(int)})
+        schema = infer_feature_schema(frame)
+        self.assertEqual(schema.value_indicators, [])
+        self.assertEqual([(u.flag, u.value) for u in schema.unresolved_availability], [("x:missing", "x")])
+        self.assertIn("not constant", schema.unresolved_availability[0].reason)
+        self.assertIn("x:missing", schema.redraw_columns)                       # an ordinary 0/1 input then
+
+    def test_a_flag_shared_by_a_block_of_values(self):
+        rng = numpy.random.default_rng(25)
+        n = 3000
+        act_missing = rng.random(n) < 0.4
+        fac_missing = act_missing & (rng.random(n) < 0.1)       # nested: no faculty data => no ACT scores
+        small_missing = numpy.zeros(n, dtype=bool)
+        small_missing[rng.choice(n, 15, replace=False)] = True  # 15 rows
+        measured_math = numpy.round(rng.normal(23.0, 2.0, n))   # the fill 23 is 20% of the measured values
+        frame = pandas.DataFrame({
+            "act:missing": act_missing.astype(int), "act": numpy.where(act_missing, 22.0, rng.normal(22, 3, n)),
+            "act_math": numpy.where(act_missing, 23.0, measured_math),
+            "block_a": numpy.where(act_missing, 0.37, rng.uniform(0, 1, n)),   # a rare fill: the share rule
+            # a structural zero, not an imputation: 0 is the minimum of a sparse share
+            "pct_sparse": numpy.where(act_missing, 0.0, numpy.where(rng.random(n) < 0.4, 0.0, rng.uniform(0, 1, n))),
+            "fac:missing": fac_missing.astype(int), "fac": numpy.where(fac_missing, 0.5, rng.uniform(0, 1, n)),
+            "small:missing": small_missing.astype(int),
+            "small": numpy.where(small_missing, 3.0, rng.normal(3.0, 1.0, n)),
+            # the interior value 2 on the 15 rows, and on half of the other rows: 0.5^15 = 3e-5 is no proof
+            "small_other": numpy.where(small_missing, 2.0, rng.choice([1.0, 2.0, 3.0], n, p=[0.25, 0.5, 0.25])),
+        })
+        schema = infer_feature_schema(frame)
+        indicators = {i.flag: i for i in schema.value_indicators}
+        # act_math: an interior fill on all ~1200 rows where the ACT block is missing, although 20% of the
+        # measured rows hold it too -- no chance; it is claimed by fac:missing as well, but belongs to the
+        # flag with the most off rows
+        self.assertEqual(indicators["act:missing"].fills, {"act": 22.0, "act_math": 23.0, "block_a": 0.37})
+        self.assertEqual(indicators["act:missing"].named, ["act"])
+        self.assertEqual(indicators["fac:missing"].fills, {"fac": 0.5})
+        # the structural zero is neither paired nor reported
+        self.assertFalse(any("pct_sparse" in i.fills for i in schema.value_indicators))
+        # an interior fill on 15 rows that half of the other rows hold too can be chance: reported, not used
+        self.assertEqual(indicators["small:missing"].fills, {"small": 3.0})
+        self.assertEqual([(u.flag, u.value) for u in schema.unresolved_availability], [("small:missing", "small_other")])
+        self.assertIn("can be chance", schema.unresolved_availability[0].reason)
+        self.assertEqual(schema.summary()["values_paired_statistically"], 2)
+
+
+class ValidityCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.X, _ = make_data(400, seed=31)
+        self.X_test, _ = make_data(200, seed=32)
+        self.schema = infer_feature_schema(self.X)
+        self.bank = CorruptionBank(self.schema, self.X, self.X_test, repetitions=1, seed=4)
+        self.clean = self.X_test.to_numpy(dtype=float)
+        self.column = {name: j for j, name in enumerate(self.X_test.columns)}
+
+    def broken(self, change) -> str:
+        X = self.clean.copy()
+        change(X)
+        with self.assertRaises(RuntimeError) as raised:
+            self.bank._check(X, "test", 0.5)
+        return str(raised.exception)
+
+    def test_every_structural_rule_is_checked(self):
+        c = self.column
+        self.assertIn("0/1 input", self.broken(lambda X: X.__setitem__((0, c["rare"]), 0.5)))
+        self.assertIn("two levels", self.broken(lambda X: X.__setitem__((slice(None), c["region_N"]), 1.0)
+                                                or X.__setitem__((slice(None), c["region_S"]), 1.0)))
+        self.assertIn("lost its level", self.broken(
+            lambda X: [X.__setitem__((0, c[name]), 0.0) for name in ("state_A", "state_B", "state_C")]))
+        measured_row = int(numpy.flatnonzero(self.clean[:, c["lab_measured"]] == 1)[0])
+        self.assertIn("'lab_measured'", self.broken(lambda X: X.__setitem__((measured_row, c["lab_measured"]), 0.0)))
+        self.bank._check(self.clean.copy(), "test", 0.5)          # the clean test set is valid
+
+    def test_a_test_row_that_already_breaks_the_rule_is_left_alone(self):
+        X_test = self.X_test.copy()
+        row = X_test.index[X_test["lab_measured"] == 0][0]
+        X_test.loc[row, "lab"] = 7.0                               # "not measured", yet not the fill value
+        bank = CorruptionBank(self.schema, self.X, X_test, repetitions=1, seed=4)
+        self.assertEqual(bank.clean_availability_violations, 1)
+        for family in bank.applicable_families():
+            corrupted, _ = bank.corrupt(family, 1.0, 0)            # no RuntimeError
+            self.assertEqual(corrupted.loc[row, "lab"], 7.0)
 
 
 if __name__ == "__main__":
