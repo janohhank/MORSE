@@ -411,13 +411,15 @@ def display_path(path: str) -> str:
 
 
 def paired_tests(per_seed: pandas.DataFrame, morse_key: str) -> pandas.DataFrame:
-    """Wilcoxon signed-rank tests of MORSE against every baseline over the seeds."""
+    """Wilcoxon signed-rank tests of MORSE against every baseline over the seeds. The differences are rounded
+    to 12 decimals first: ROC-AUC values are discrete, so exact ties and zeros are common, and floating-point
+    noise of ~1e-17 would break them (and count a zero difference as a win)."""
     reference: pandas.DataFrame = per_seed[per_seed["model"] == morse_key].set_index("seed").sort_index()
     rows: list[dict[str, Any]] = []
     for other in BASELINES:
         baseline: pandas.DataFrame = per_seed[per_seed["model"] == other].set_index("seed").sort_index()
         for metric, description in TESTED_METRICS.items():
-            difference: pandas.Series = reference[metric] - baseline[metric]
+            difference: pandas.Series = (reference[metric] - baseline[metric]).round(12)
             p_value: float = float("nan") if numpy.allclose(difference, 0.0) else float(wilcoxon(difference).pvalue)
             rows.append({
                 "baseline": BASELINES[other], "metric": metric, "description": description,

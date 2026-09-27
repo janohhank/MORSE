@@ -671,8 +671,12 @@ def _summary(family_scores: pandas.DataFrame, models_frame: pandas.DataFrame) ->
 
 def _wilcoxon(differences: numpy.ndarray) -> float:
     """Two-sided Wilcoxon signed-rank p-value (exact for small samples without ties); NaN if every
-    difference is zero or there are fewer than two."""
-    differences = differences[~numpy.isnan(differences)]
+    difference is zero or there are fewer than two. The differences are rounded to 12 decimals first:
+    ROC-AUC values are discrete (multiples of 1 / (m1 m0) on an unweighted test set), so exact ties and
+    zeros between the differences are common, and floating-point noise of ~1e-17 would break them and
+    decide between scipy's exact (no ties) and approximate (tie-corrected) distribution. On the College
+    Scorecard run of 2026-09-27 that moved p for under-recording at level 0.1 from 0.126 to 0.133."""
+    differences = numpy.round(differences[~numpy.isnan(differences)], 12)
     if differences.size < 2 or numpy.allclose(differences, 0.0):
         return float("nan")
     return float(wilcoxon(differences).pvalue)
@@ -720,7 +724,8 @@ def _tests(family_scores: pandas.DataFrame, scenarios: pandas.DataFrame,
                     "family": family, "severity": severity, "statistic": statistic, "baseline": baseline,
                     "n_runs": int(differences.size), "mean_difference": float(numpy.mean(differences)),
                     "median_difference": float(numpy.median(differences)),
-                    "n_morse_better": int((differences > 0).sum()), "p_value": _wilcoxon(differences)}
+                    "n_morse_better": int((numpy.round(differences, 12) > 0).sum()),   # a 1e-17 "win" is a tie
+                    "p_value": _wilcoxon(differences)}
                 if baseline == "single" and statistic == "delta_roc_auc" and (family, severity) in share:
                     row["scenario_share_morse_better"], row["n_scenarios"] = share[(family, severity)]
                 rows.append(row)

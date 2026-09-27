@@ -386,6 +386,22 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(numpy.isnan(evaluation._wilcoxon(numpy.array([0.1]))))
         self.assertLess(evaluation._wilcoxon(numpy.arange(1.0, 21.0)), 0.001)
         self.assertTrue(numpy.isnan(evaluation.partial_spearman(numpy.ones(6), numpy.arange(6.0), numpy.arange(6.0))))
+
+    def test_wilcoxon_keeps_ties_that_floating_point_noise_breaks(self):
+        # Changes of a discrete ROC-AUC: the second and third differences are tied and the first is zero in
+        # exact arithmetic, but come out of the subtraction with ~1e-17 of noise. The noise must not decide
+        # the test (exact no-ties distribution vs tie-corrected approximation) or count as a win.
+        exact = numpy.array([0.0, 1.0, 1.0, 2.0, -3.0, 4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, -11.0, 12.0, 13.0,
+                             14.0, 15.0, 16.0, 17.0, 18.0]) * 3.0358227079e-05
+        noisy = exact + numpy.array([2.2e-17, 0.0, 7.7e-18] + [0.0] * 17)
+        self.assertEqual(evaluation._wilcoxon(noisy), evaluation._wilcoxon(exact))
+        family_scores = pandas.DataFrame({
+            "family": "gaussian_noise", "severity": 0.1, "method": ["multi"] * 20 + ["single"] * 20,
+            "seed": list(range(20)) * 2, "delta_roc_auc": list(noisy) + [0.0] * 20})
+        tests = evaluation._tests(family_scores, pandas.DataFrame(), pandas.DataFrame())
+        row = tests[(tests["statistic"] == "delta_roc_auc") & (tests["baseline"] == "single")].iloc[0]
+        self.assertEqual(row["n_morse_better"], 16)   # the 2.2e-17 "difference" is a tie, not a win
+        self.assertEqual(row["p_value"], evaluation._wilcoxon(exact))
         self.assertEqual(evaluation._format_p(float("nan")).strip(), "--")
         self.assertEqual(evaluation._format_p(0.0001), "1.0e-04")
         self.assertEqual(evaluation._format_p(0.25), "0.250")
