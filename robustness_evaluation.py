@@ -5,8 +5,9 @@ all-features model -- is scored on the test set under two kinds of stress (robus
 docs/robustness.md):
 
   re-weighted test populations  population shifts (leading principal components, typical vs atypical
-                                rows) and dependence shifts (pairs of correlated inputs made less or more
-                                dependent); severity = the effective sample size left on the training rows
+                                rows; severity = the effective sample size left on the training rows) and
+                                dependence shifts (pairs of correlated inputs weakened -- a share of the
+                                correlation removed, 100% = uncorrelated -- or strengthened)
   corrupted test sets           measurement noise, recording noise of 0/1 inputs, under-recording, values
                                 that are not available; one fixed bank of realisations for every model
 
@@ -16,10 +17,11 @@ not depend on the class prevalence); PR-AUC (average precision) is reported as w
 at the unshifted prevalence (robustness_utils.normalise_within_classes).
 
 Statistics: the unit of replication is the GA run (seed). For every family and severity each model gets
-one number -- the mean over the family's usable scenarios (re-weighting) or over the corruption bank
-(corruption) -- and MORSE is compared with the SO-GA by a paired two-sided Wilcoxon signed-rank test over
-the seeds, and with the deterministic SFS and all-features models by the one-sample test against their
-single value.
+one number -- the worst scenario / the mean over the pairs of the family's COHORT (re-weighting: the
+scenarios usable at every level of the family, so every level compares the same scenarios) or the mean
+over the corruption bank (corruption) -- and MORSE is compared with the SO-GA by a paired two-sided
+Wilcoxon signed-rank test over the seeds, and with the deterministic SFS and all-features models by the
+one-sample test against their single value.
 
 Two ways to run it
   * in training_notebook.ipynb, right after training: `build_final_models` + `run_robustness_suite`;
@@ -33,8 +35,9 @@ Outputs (default: <run>/evaluation/robustness/; robustness_<rule>/ for a Pareto 
   config.json                 the suite settings and the provenance of the evaluation
   schema.json                 the inferred feature schema
   models.csv                  every final model: size, sign consistency, clean ROC-AUC / PR-AUC
-  scenarios.csv               every re-weighting scenario: strength, ESS (training / test / per class),
-                              support, and what actually moved (statistic, correlation, means, SDs)
+  scenarios.csv               every re-weighting scenario: level, strength, ESS (training / test / per
+                              class), attainable / supported / usable / in the cohort, and what actually
+                              moved (statistic, target and reached correlation, means, SDs)
   reweighting_scores.csv      every model under every re-weighting scenario
   corruption_scores.csv       every model under every corruption level and repetition
   corruption_diagnostics.csv  what every corrupted test set changed (and what had to be undone)
@@ -42,6 +45,7 @@ Outputs (default: <run>/evaluation/robustness/; robustness_<rule>/ for a Pareto 
   summary.csv                 per family, severity and method: mean over runs, SDs, change, worst case
   tests.csv                   MORSE against every baseline, per family and severity
   sign_vs_degradation.csv     sign consistency vs degradation of the GA models (exploratory)
+  supplementary_per_level_*.csv  the re-weighting families over every scenario usable at each level
   report.txt                  the printed report
   robustness_*.png            five figures
 """
@@ -75,7 +79,7 @@ import robustness_utils
 from plot_utils import (plot_corruption_curves, plot_dependence_shift_summary, plot_population_shift_curves,
                         plot_robustness_overview, plot_sign_vs_degradation)
 from robustness_config import RobustnessConfig
-from robustness_utils import (CorruptionBank, DependenceTilt, FeatureSchema, calibrate_strengths,
+from robustness_utils import (CorruptionBank, DependenceTilt, FeatureSchema, calibrate_correlation, calibrate_strengths,
                               class_effective_sizes, dependence_pairs, effective_sample_fraction,
                               exponential_tilt, infer_feature_schema, normalise_within_classes,
                               population_axes, weighted_average_precision, weighted_correlation,
@@ -90,10 +94,10 @@ METHOD_STYLES: dict[str, tuple[str, str, str, str]] = {
     "forward": ("SFS", "tab:red", "D", ":"),
     "all":     ("All features", "tab:green", "^", "-."),
 }
-REWEIGHTING_FAMILIES: tuple[str, ...] = ("population", "dependence_decorrelate", "dependence_strengthen")
+REWEIGHTING_FAMILIES: tuple[str, ...] = ("population", "dependence_weaken", "dependence_strengthen")
 FAMILY_LABELS: dict[str, str] = {
     "population": "Population shift",
-    "dependence_decorrelate": "Dependence: decorrelated pairs",
+    "dependence_weaken": "Dependence: weakened pairs",
     "dependence_strengthen": "Dependence: strengthened pairs",
     "gaussian_noise": "Measurement noise",
     "binary_redraw": "Recording noise (0/1 re-drawn)",
@@ -107,6 +111,35 @@ CORRUPTION_LEVEL_LABELS: dict[str, str] = {
     "under_recording": "probability that a recorded 1 is lost",
     "value_masking": "probability that an available value is withheld",
 }
+
+
+def family_levels(family: str, config: RobustnessConfig) -> tuple[float, ...]:
+    """The severity levels of a family, mildest first: the training ESS of a population shift, the share
+    of the correlation removed / added by a dependence shift, the corruption level."""
+    if family == "population":
+        return tuple(config.ess_levels)
+    if family == "dependence_weaken":
+        return tuple(config.dependence_weaken_levels)
+    if family == "dependence_strengthen":
+        return tuple(config.dependence_strengthen_levels)
+    return tuple(config.corruption_levels)
+
+
+def headline_level(family: str, config: RobustnessConfig) -> float:
+    """The severity at which a family enters the overview figure and the sign-consistency analysis."""
+    return {"population": config.headline_ess, "dependence_weaken": config.headline_weaken,
+            "dependence_strengthen": config.headline_strengthen}.get(family, config.headline_corruption_level)
+
+
+def severity_text(family: str, level: float) -> str:
+    """"60% ESS" (population), "r -100%" (the pair's correlation removed), "r +50%" (added), "0.5"."""
+    if family == "population":
+        return f"{level:.0%} ESS"
+    if family == "dependence_weaken":
+        return f"r -{100 * level:g}%"
+    if family == "dependence_strengthen":
+        return f"r +{100 * level:g}%"
+    return f"{level:g}"
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +302,11 @@ def run_robustness_suite(
     # ---- re-weighted populations
     scenarios, reweighting_scores, n_eligible_pairs, n_pairs = _reweighting(
         X_train, X_test, y_te, schema, models, clean, config)
-    n_usable: int = int((scenarios["supported"] & ~scenarios["saturated"]).sum()) if not scenarios.empty else 0
-    say(f"Re-weighting: {len(scenarios)} scenarios ({n_usable} usable = supported by the test set "
-        f"and not saturated); dependence pairs: {n_eligible_pairs} eligible, {n_pairs} used.")
+    n_usable: int = int(scenarios["usable"].sum()) if not scenarios.empty else 0
+    say(f"Re-weighting: {len(scenarios)} scenarios, {n_usable} usable (attainable on the training rows and "
+        f"supported by enough effective rows); dependence pairs: {n_eligible_pairs} eligible, {n_pairs} used.")
+    say(f"Cohorts -- the units usable at every level of their family, which the main analysis uses: "
+        f"{_cohort_line(scenarios)}.")
 
     # ---- corrupted test sets
     corruption_scores, diagnostics, applicable, clean_violations = _corruption(
@@ -287,20 +322,29 @@ def run_robustness_suite(
             f"{config.headline_corruption_level:g} (diagnostic): "
             + ", ".join(f"{FAMILY_LABELS[family]} {share:.0%}" for family, share in shares.items()) + ".")
 
-    # ---- summaries
+    # ---- summaries: every family over its cohort (the scenarios usable at every level of the family)
     all_family_scores: pandas.DataFrame = _model_family_scores(scenarios, reweighting_scores, corruption_scores)
-    # a dependence family is summarised at a severity only with enough usable pairs there
-    all_family_scores["summarised"] = (
-        ~(all_family_scores["family"].astype(str).str.startswith("dependence_")
-          & (all_family_scores["n_scenarios"] < config.min_pairs)) if not all_family_scores.empty else [])
+    cohort_sizes: dict[str, int] = ({family: int(part.loc[part["in_cohort"], "unit"].nunique())
+                                     for family, part in scenarios.groupby("family")} if not scenarios.empty else {})
+    # a dependence family is summarised only if its cohort has enough pairs
+    too_small: list[str] = [family for family in FAMILY_ORDER
+                            if family.startswith("dependence_") and cohort_sizes.get(family, config.min_pairs)
+                            < config.min_pairs]
+    all_family_scores["summarised"] = (~all_family_scores["family"].isin(too_small)
+                                       if not all_family_scores.empty else [])
     family_scores: pandas.DataFrame = all_family_scores[all_family_scores["summarised"].astype(bool)].drop(
         columns="summarised").reset_index(drop=True)
-    skipped: pandas.DataFrame = (
-        all_family_scores.loc[~all_family_scores["summarised"].astype(bool), ["family", "severity", "n_scenarios"]]
-        .drop_duplicates() if not all_family_scores.empty else pandas.DataFrame())
+    skipped: pandas.DataFrame = pandas.DataFrame([{"family": family, "n_scenarios": cohort_sizes[family]}
+                                                  for family in too_small])
     summary: pandas.DataFrame = _summary(family_scores, models_frame)
     tests: pandas.DataFrame = _tests(family_scores, scenarios, reweighting_scores)
     sign_points, sign_summary = _sign_analysis(models_frame, family_scores, config)
+    # supplementary: the re-weighting families over every scenario usable at each level (a different
+    # set of scenarios per level -- answers another question than the main analysis)
+    per_level_scores: pandas.DataFrame = _model_family_scores(scenarios, reweighting_scores, pandas.DataFrame(),
+                                                              cohort_only=False)
+    per_level_summary: pandas.DataFrame = _summary(per_level_scores, models_frame)
+    per_level_tests: pandas.DataFrame = _tests(per_level_scores, scenarios, reweighting_scores, cohort_only=False)
 
     # ---- files
     atomic_write_json(os.path.join(output_directory, "config.json"),
@@ -310,7 +354,8 @@ def run_robustness_suite(
         "models.csv": models_frame, "scenarios.csv": scenarios, "reweighting_scores.csv": reweighting_scores,
         "corruption_scores.csv": corruption_scores, "corruption_diagnostics.csv": diagnostics,
         "model_family_scores.csv": all_family_scores, "summary.csv": summary, "tests.csv": tests,
-        "sign_vs_degradation.csv": sign_summary}
+        "sign_vs_degradation.csv": sign_summary, "supplementary_per_level_summary.csv": per_level_summary,
+        "supplementary_per_level_tests.csv": per_level_tests}
     for name, frame in tables.items():
         frame.to_csv(os.path.join(output_directory, name), index=False)
     sign_points.to_csv(os.path.join(output_directory, "sign_vs_degradation_points.csv"), index=False)
@@ -335,25 +380,32 @@ def run_robustness_suite(
 def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: numpy.ndarray,
                  schema: FeatureSchema, models: list[_Model], clean: dict[str, numpy.ndarray],
                  config: RobustnessConfig) -> tuple[pandas.DataFrame, pandas.DataFrame, int, int]:
+    """Every re-weighting scenario (scenarios.csv) and every model under it (reweighting_scores.csv).
+
+    A scenario is `attainable` if its severity can be realised on the training rows, `supported` if the
+    re-weighting leaves enough effective rows (training ESS, test ESS, per class), `usable` if both, and
+    `in_cohort` if its unit -- a population axis and direction, or a dependence pair -- is usable at
+    EVERY level of its family: the main summaries, tests and figures use exactly those scenarios."""
     scenario_rows: list[dict[str, Any]] = []
     score_rows: list[tuple] = []
     clean_roc: dict[str, float] = {key: weighted_roc_auc(y_test, p) for key, p in clean.items()}
     clean_ap: dict[str, float] = {key: weighted_average_precision(y_test, p) for key, p in clean.items()}
 
     def add(row: dict[str, Any], w_train: numpy.ndarray | None, w_test: numpy.ndarray | None) -> None:
-        """Record a scenario and score every model under it; a saturated scenario (its severity cannot
-        be reached, so there are no weights) is only recorded."""
+        """Record a scenario and score every model under it; an unattainable scenario (its severity cannot
+        be realised, so there are no weights) is only recorded."""
         if w_train is None or w_test is None:
             row.update({"train_ess": numpy.nan, "test_ess": numpy.nan, "ess_negatives": numpy.nan,
                         "ess_positives": numpy.nan, "supported": False, "weighted_prevalence": numpy.nan})
             scenario_rows.append(row)
             return
         negatives, positives = class_effective_sizes(w_test, y_test)
+        train_ess: float = effective_sample_fraction(w_train)
         test_ess: float = effective_sample_fraction(w_test)
         row.update({
-            "train_ess": effective_sample_fraction(w_train), "test_ess": test_ess,
-            "ess_negatives": negatives, "ess_positives": positives,
-            "supported": bool(test_ess >= config.min_test_ess_fraction
+            "train_ess": train_ess, "test_ess": test_ess, "ess_negatives": negatives, "ess_positives": positives,
+            "supported": bool(train_ess >= config.min_train_ess_fraction
+                              and test_ess >= config.min_test_ess_fraction
                               and min(negatives, positives) >= config.min_class_ess),
             "weighted_prevalence": float(w_test @ y_test / w_test.sum())})
         scenario_rows.append(row)
@@ -365,7 +417,7 @@ def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: nu
             score_rows.append((row["scenario_id"], model.method, model.seed, roc, ap,
                                roc - clean_roc[model.key], ap - clean_ap[model.key]))
 
-    # population shifts
+    # population shifts: severity = the training ESS
     for axis in population_axes(X_train, X_test, config):
         for direction, sign in (("+", 1.0), ("-", -1.0)):
             calibrated = calibrate_strengths(
@@ -373,9 +425,9 @@ def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: nu
             for level, (strength, saturated) in zip(config.ess_levels, calibrated):
                 row: dict[str, Any] = {
                     "scenario_id": f"population|{axis.name}|{direction}|{level:g}", "family": "population",
-                    "scenario": axis.name, "direction": direction,
-                    "emphasis": axis.positive if sign > 0 else axis.negative, "ess_level": level,
-                    "strength": numpy.nan if saturated else sign * strength, "saturated": saturated,
+                    "scenario": axis.name, "unit": f"{axis.name} {direction}", "direction": direction,
+                    "emphasis": axis.positive if sign > 0 else axis.negative, "level": level,
+                    "strength": numpy.nan if saturated else sign * strength, "attainable": not saturated,
                     "description": axis.description}
                 if saturated:
                     add(row, None, None)
@@ -385,7 +437,7 @@ def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: nu
                 row["statistic_shift"] = float(w_test @ axis.test / w_test.sum() - axis.test.mean())
                 add(row, w_train, w_test)
 
-    # dependence shifts
+    # dependence shifts: severity = the share of the pair's training (score) correlation removed / added
     pairs, n_eligible = dependence_pairs(X_train, X_test, schema, config)
     binary: set[str] = set(schema.binary)
     for pair in pairs:
@@ -393,25 +445,34 @@ def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: nu
         a_test, b_test = X_test[pair.a].to_numpy(dtype=float), X_test[pair.b].to_numpy(dtype=float)
         tilt: DependenceTilt = DependenceTilt(a_train, b_train, a_test, b_test,
                                               pair.a in binary, pair.b in binary, config.score_clip)
-        clean_correlation: float = weighted_correlation(a_test, b_test)
+        score_correlation: float = tilt.score_correlation(0.0)
+        clean_test_correlation: float = weighted_correlation(a_test, b_test)
         sd_a, sd_b = float(a_train.std()), float(b_train.std())
-        towards_positive: float = 1.0 if pair.correlation > 0 else -1.0
-        for direction, sign in (("decorrelate", -towards_positive), ("strengthen", towards_positive)):
-            calibrated = calibrate_strengths(lambda s: tilt.train_ess(sign * s), config.ess_levels)
-            for level, (strength, saturated) in zip(config.ess_levels, calibrated):
+        for direction, levels, sign in (("weaken", config.dependence_weaken_levels, -1.0),
+                                        ("strengthen", config.dependence_strengthen_levels, 1.0)):
+            targets: list[float] = [score_correlation * (1.0 + sign * share) for share in levels]
+            # a correlation cannot reach +-1; the targets beyond are unattainable without a search
+            possible: int = next((i for i, target in enumerate(targets) if abs(target) >= 0.999), len(targets))
+            calibrated = calibrate_correlation(tilt, targets[:possible]) if possible else []
+            calibrated += [(float("nan"), False)] * (len(targets) - len(calibrated))
+            for level, target, (strength, reached) in zip(levels, targets, calibrated):
                 row = {"scenario_id": f"dependence|{pair.a} x {pair.b}|{direction}|{level:g}",
                        "family": f"dependence_{direction}", "scenario": f"{pair.a} x {pair.b}",
-                       "direction": direction, "emphasis": direction, "ess_level": level,
-                       "strength": numpy.nan if saturated else sign * strength, "saturated": saturated,
+                       "unit": f"{pair.a} x {pair.b}", "direction": direction, "emphasis": direction, "level": level,
+                       "strength": strength, "attainable": reached,
                        "pair_a": pair.a, "pair_b": pair.b, "pair_kind": pair.kind,
-                       "correlation_train": pair.correlation, "correlation_test": clean_correlation}
-                if saturated:
+                       "correlation_train": pair.correlation, "correlation_test": clean_test_correlation,
+                       "score_correlation_clean": score_correlation, "score_correlation_target": target}
+                if not reached:
                     add(row, None, None)
                     continue
-                w_train, w_test = tilt.weights(sign * strength)
+                w_train, w_test = tilt.weights(strength)
                 shares: numpy.ndarray = w_test / w_test.sum()
                 row.update({
-                    "correlation_weighted": weighted_correlation(a_test, b_test, w_test),
+                    "score_correlation_reached": weighted_correlation(
+                        tilt._train_stats[:, 0], tilt._train_stats[:, 1], w_train),
+                    "correlation_train_weighted": weighted_correlation(a_train, b_train, w_train),
+                    "correlation_test_weighted": weighted_correlation(a_test, b_test, w_test),
                     "mean_shift_a": float((shares @ a_test - a_test.mean()) / sd_a),
                     "mean_shift_b": float((shares @ b_test - b_test.mean()) / sd_b),
                     "sd_ratio_a": _sd_ratio(a_test, shares),
@@ -420,12 +481,33 @@ def _reweighting(X_train: pandas.DataFrame, X_test: pandas.DataFrame, y_test: nu
                 add(row, w_train, w_test)
 
     scenarios: pandas.DataFrame = pandas.DataFrame(scenario_rows)
+    if not scenarios.empty:
+        scenarios["usable"] = scenarios["attainable"].astype(bool) & scenarios["supported"].astype(bool)
+        needed: dict[str, int] = {family: len(family_levels(family, config)) for family in REWEIGHTING_FAMILIES}
+        counts: pandas.Series = scenarios[scenarios["usable"]].groupby(["family", "unit"])["level"].nunique()
+        complete: set[tuple[str, str]] = {key for key, n in counts.items() if n == needed[key[0]]}
+        scenarios["in_cohort"] = [(family, unit) in complete
+                                  for family, unit in zip(scenarios["family"], scenarios["unit"])]
     scores: pandas.DataFrame = pandas.DataFrame(score_rows, columns=[
         "scenario_id", "method", "seed", "roc_auc", "pr_auc", "delta_roc_auc", "delta_pr_auc"])
     scores["seed"] = scores["seed"].astype("Int64")
     return scenarios, scores, n_eligible, len(pairs)
 
 
+def _cohort_line(scenarios: pandas.DataFrame) -> str:
+    """How many units every re-weighting family has, and how many of them are in its cohort."""
+    if scenarios.empty:
+        return "no re-weighting scenario"
+    parts: list[str] = []
+    names: dict[str, str] = {"population": "population axis-directions", "dependence_weaken": "weakened pairs",
+                             "dependence_strengthen": "strengthened pairs"}
+    for family in REWEIGHTING_FAMILIES:
+        part: pandas.DataFrame = scenarios[scenarios["family"] == family]
+        if part.empty:
+            continue
+        in_cohort: int = part.loc[part["in_cohort"], "unit"].nunique()
+        parts.append(f"{names[family]} {in_cohort}/{part['unit'].nunique()}")
+    return ", ".join(parts)
 def _sd_ratio(values: numpy.ndarray, shares: numpy.ndarray) -> float:
     """SD of a column under the weights (`shares` sum to 1) relative to its unweighted SD."""
     unweighted: float = float(values.std())
@@ -482,34 +564,42 @@ def headline_statistic(family: str) -> tuple[str, str, str]:
 
 
 def _in_order(frame: pandas.DataFrame) -> pandas.DataFrame:
-    """Families in FAMILY_ORDER; within a family the mildest severity first (re-weighting: the highest
-    ESS; corruption: the lowest level); methods in METHODS order."""
+    """Families in FAMILY_ORDER; within a family the mildest severity first (population: the highest
+    ESS; the others: the lowest level); methods in METHODS order."""
     if frame.empty:
         return frame
     family_rank: pandas.Series = frame["family"].map({f: i for i, f in enumerate(FAMILY_ORDER)})
     severity: pandas.Series = frame["severity"].astype(float)
-    severity_rank: pandas.Series = severity.where(~frame["family"].isin(REWEIGHTING_FAMILIES), -severity)
+    severity_rank: pandas.Series = severity.where(frame["family"] != "population", -severity)
     keys: dict[str, pandas.Series] = {"_family": family_rank, "_severity": severity_rank}
     if "method" in frame:
         keys["_method"] = frame["method"].map({m: i for i, m in enumerate(METHODS)})
     return (frame.assign(**keys).sort_values(list(keys), kind="stable")
             .drop(columns=list(keys)).reset_index(drop=True))
 
+
+def _selected_scenarios(scenarios: pandas.DataFrame, cohort_only: bool) -> pandas.DataFrame:
+    """The re-weighting scenarios a summary uses: the family's cohort (usable at every level), or -- for
+    the supplementary per-level analysis -- every usable scenario of each level."""
+    chosen: pandas.Series = scenarios["usable"] & (scenarios["in_cohort"] if cohort_only else True)
+    return scenarios.loc[chosen, ["scenario_id", "family", "level"]]
+
+
 def _model_family_scores(scenarios: pandas.DataFrame, reweighting_scores: pandas.DataFrame,
-                         corruption_scores: pandas.DataFrame) -> pandas.DataFrame:
-    """One row per family, severity and model: re-weighting -> mean and minimum over the family's usable
-    scenarios; corruption -> mean over the repetitions, and their SD (the corruption variability)."""
+                         corruption_scores: pandas.DataFrame, cohort_only: bool = True) -> pandas.DataFrame:
+    """One row per family, severity and model: re-weighting -> mean and minimum over the family's cohort
+    (`cohort_only`) or over every usable scenario of the level; corruption -> mean over the repetitions,
+    and their SD (the corruption variability)."""
     frames: list[pandas.DataFrame] = []
     if not scenarios.empty:
-        usable: pandas.DataFrame = scenarios.loc[scenarios["supported"] & ~scenarios["saturated"],
-                                                 ["scenario_id", "family", "ess_level"]]
-        merged: pandas.DataFrame = reweighting_scores.merge(usable, on="scenario_id")
+        merged: pandas.DataFrame = reweighting_scores.merge(_selected_scenarios(scenarios, cohort_only),
+                                                            on="scenario_id")
         if not merged.empty:
-            frames.append(merged.groupby(["family", "ess_level", "method", "seed"], dropna=False).agg(
+            frames.append(merged.groupby(["family", "level", "method", "seed"], dropna=False).agg(
                 roc_auc=("roc_auc", "mean"), delta_roc_auc=("delta_roc_auc", "mean"),
                 pr_auc=("pr_auc", "mean"), delta_pr_auc=("delta_pr_auc", "mean"),
                 worst_roc_auc=("roc_auc", "min"), worst_delta_roc_auc=("delta_roc_auc", "min"),
-                n_scenarios=("roc_auc", "size")).reset_index().rename(columns={"ess_level": "severity"}))
+                n_scenarios=("roc_auc", "size")).reset_index().rename(columns={"level": "severity"}))
     if not corruption_scores.empty:
         frames.append(corruption_scores.groupby(["family", "level", "method", "seed"], dropna=False).agg(
             roc_auc=("roc_auc", "mean"), delta_roc_auc=("delta_roc_auc", "mean"),
@@ -562,24 +652,24 @@ def _wilcoxon(differences: numpy.ndarray) -> float:
 
 
 def _tests(family_scores: pandas.DataFrame, scenarios: pandas.DataFrame,
-           reweighting_scores: pandas.DataFrame) -> pandas.DataFrame:
+           reweighting_scores: pandas.DataFrame, cohort_only: bool = True) -> pandas.DataFrame:
     """MORSE against every baseline, per family, severity and statistic (the per-run mean ROC-AUC, its
-    change from the model's clean score, and for re-weighting the worst usable scenario and its change;
+    change from the model's clean score, and for re-weighting the worst scenario and its change;
     `headline_statistic` says which one summarises a family). A positive difference means MORSE is
     better (higher score, smaller loss). Against the SO-GA: paired over the seeds; against SFS / all
     features: MORSE's seeds against the baseline's single value. For the re-weighting families the table
-    also gives the share of usable scenarios in which MORSE's run-averaged change is better than the
-    SO-GA's (descriptive only: the scenarios share their test rows, so they are not independent)."""
+    also gives the share of the scenarios (the same ones as `family_scores`: the cohort, or every usable
+    one) in which MORSE's run-averaged change is better than the SO-GA's (descriptive only: the scenarios
+    share their test rows, so they are not independent)."""
     share: dict[tuple[str, float], tuple[float, int]] = {}
     if not scenarios.empty:
-        usable: pandas.DataFrame = scenarios.loc[scenarios["supported"] & ~scenarios["saturated"],
-                                                 ["scenario_id", "family", "ess_level"]]
-        merged: pandas.DataFrame = reweighting_scores.merge(usable, on="scenario_id")
+        merged: pandas.DataFrame = reweighting_scores.merge(_selected_scenarios(scenarios, cohort_only),
+                                                            on="scenario_id")
         per_scenario: pandas.DataFrame = merged[merged["method"].isin(["multi", "single"])].groupby(
-            ["family", "ess_level", "scenario_id", "method"])["delta_roc_auc"].mean().unstack("method")
+            ["family", "level", "scenario_id", "method"])["delta_roc_auc"].mean().unstack("method")
         if {"multi", "single"} <= set(per_scenario.columns):
             better: pandas.Series = (per_scenario["multi"] > per_scenario["single"]).groupby(
-                level=["family", "ess_level"]).agg(["mean", "size"])
+                level=["family", "level"]).agg(["mean", "size"])
             share = {key: (float(value["mean"]), int(value["size"])) for key, value in better.iterrows()}
 
     rows: list[dict[str, Any]] = []
@@ -626,7 +716,7 @@ def partial_spearman(x: numpy.ndarray, y: numpy.ndarray, z: numpy.ndarray) -> fl
 def _sign_analysis(models_frame: pandas.DataFrame, family_scores: pandas.DataFrame,
                    config: RobustnessConfig) -> tuple[pandas.DataFrame, pandas.DataFrame]:
     """Sign consistency S of every GA model (MORSE and SO-GA, all seeds) against its change of ROC-AUC
-    per family (the family's headline statistic, at the headline severity), also given the model size K
+    per family (the family's headline statistic, at its headline severity), also given the model size K
     (partial Spearman). Exploratory: a correlation does not show that S causes the difference."""
     ga: pandas.DataFrame = models_frame[models_frame["method"].isin(["multi", "single"])][
         ["method", "seed", "sign_consistency", "n_features"]]
@@ -634,7 +724,7 @@ def _sign_analysis(models_frame: pandas.DataFrame, family_scores: pandas.DataFra
     rows: list[dict[str, Any]] = []
     present: set[str] = set(family_scores["family"]) if not family_scores.empty else set()
     for family in [f for f in FAMILY_ORDER if f in present]:
-        severity: float = config.headline_ess if family in REWEIGHTING_FAMILIES else config.headline_corruption_level
+        severity: float = headline_level(family, config)
         change: str = headline_statistic(family)[1]
         part: pandas.DataFrame = family_scores[(family_scores["family"] == family)
                                                & numpy.isclose(family_scores["severity"].astype(float), severity)]
@@ -659,6 +749,32 @@ def _sign_analysis(models_frame: pandas.DataFrame, family_scores: pandas.DataFra
 # Figures and report
 # ---------------------------------------------------------------------------
 
+def _dependence_plot_data(scenarios: pandas.DataFrame, reweighting_scores: pandas.DataFrame,
+                          config: RobustnessConfig) -> tuple[pandas.DataFrame, pandas.DataFrame, dict[str, int]]:
+    """What the dependence figure shows -- computed from the same cohort as summary.csv and tests.csv:
+    (curves: mean change over the cohort per run, then mean and SD across runs; differences: MORSE minus
+    SO-GA per pair, each averaged over the runs; cohort size per direction). A direction whose cohort
+    has fewer than `min_pairs` pairs is left out, as in the report."""
+    cohort: pandas.DataFrame = scenarios[scenarios["family"].str.startswith("dependence_")
+                                         & scenarios["usable"] & scenarios["in_cohort"]]
+    sizes: dict[str, int] = cohort.groupby("direction")["unit"].nunique().to_dict()
+    cohort = cohort[cohort["direction"].isin([d for d, size in sizes.items() if size >= config.min_pairs])]
+    merged: pandas.DataFrame = reweighting_scores.merge(
+        cohort[["scenario_id", "direction", "unit", "level"]], on="scenario_id")
+    if merged.empty:
+        return pandas.DataFrame(), pandas.DataFrame(), sizes
+    per_run: pandas.DataFrame = merged.groupby(["direction", "level", "method", "seed"], dropna=False)[
+        "delta_roc_auc"].mean().reset_index()
+    curves: pandas.DataFrame = per_run.groupby(["direction", "level", "method"], dropna=False)["delta_roc_auc"].agg(
+        mean="mean", sd=lambda v: v.std(ddof=1) if len(v) > 1 else numpy.nan).reset_index()
+    per_pair: pandas.DataFrame = merged[merged["method"].isin(["multi", "single"])].groupby(
+        ["direction", "level", "unit", "method"])["delta_roc_auc"].mean().unstack("method")
+    differences: pandas.DataFrame = pandas.DataFrame()
+    if {"multi", "single"} <= set(per_pair.columns):
+        differences = (per_pair["multi"] - per_pair["single"]).rename("difference").reset_index()
+    return curves, differences, sizes
+
+
 def _figures(directory: str, config: RobustnessConfig, scenarios: pandas.DataFrame,
              reweighting_scores: pandas.DataFrame, corruption_scores: pandas.DataFrame,
              family_scores: pandas.DataFrame, models_frame: pandas.DataFrame,
@@ -674,17 +790,15 @@ def _figures(directory: str, config: RobustnessConfig, scenarios: pandas.DataFra
 
     clean_curve: pandas.DataFrame = across_runs(clean_per_model.assign(position=0), ["position"], "clean_roc_auc")
 
-    usable: pandas.DataFrame = scenarios.loc[scenarios["supported"] & ~scenarios["saturated"]] \
-        if not scenarios.empty else scenarios
-    if not usable.empty:
-        merged: pandas.DataFrame = reweighting_scores.merge(
-            usable[["scenario_id", "family", "scenario", "direction", "ess_level"]], on="scenario_id")
-
-        # population: one panel per axis, both directions
-        population: pandas.DataFrame = merged[merged["family"] == "population"].copy()
+    if not scenarios.empty:
+        # population: one panel per axis, both directions, over the axis-directions usable at every level
+        cohort: pandas.DataFrame = scenarios[(scenarios["family"] == "population") & scenarios["usable"]
+                                             & scenarios["in_cohort"]]
+        population: pandas.DataFrame = reweighting_scores.merge(
+            cohort[["scenario_id", "scenario", "direction", "level"]], on="scenario_id")
         if not population.empty:
             rank: dict[float, int] = {level: i + 1 for i, level in enumerate(levels)}
-            population["position"] = population["ess_level"].map(rank) * population["direction"].map({"+": 1, "-": -1})
+            population["position"] = population["level"].map(rank) * population["direction"].map({"+": 1, "-": -1})
             curves: pandas.DataFrame = across_runs(population, ["scenario", "position"], "roc_auc").rename(
                 columns={"scenario": "axis"})
             axes_order: list[str] = list(dict.fromkeys(scenarios.loc[scenarios["family"] == "population", "scenario"]))
@@ -697,33 +811,18 @@ def _figures(directory: str, config: RobustnessConfig, scenarios: pandas.DataFra
             plot_population_shift_curves(with_clean, panels, levels, styles,
                                          os.path.join(directory, "robustness_population.png"),
                                          "Population shifts: test ROC-AUC of the re-weighted test population\n"
-                                         "(mean over runs; band = SD across runs)")
+                                         "(axis-directions usable at every level; mean over runs, band = SD across runs)")
 
-        # dependence: mean change over the pairs usable at EVERY level (so that the curves compare the same
-        # pairs across the levels), and MORSE - SO-GA per pair
-        dependence: pandas.DataFrame = merged[merged["family"].str.startswith("dependence_")].copy()
-        levels_per_pair: pandas.Series = usable[usable["family"].str.startswith("dependence_")].groupby(
-            ["direction", "scenario"])["ess_level"].nunique()
-        common: pandas.DataFrame = levels_per_pair[levels_per_pair == len(levels)].reset_index()[
-            ["direction", "scenario"]]
-        n_common: dict[str, int] = common["direction"].value_counts().to_dict()
-        enough: list[str] = [direction for direction, count in n_common.items() if count >= config.min_pairs]
-        dependence = dependence.merge(common[common["direction"].isin(enough)], on=["direction", "scenario"])
-        if not dependence.empty:
-            per_run: pandas.DataFrame = dependence.groupby(["direction", "ess_level", "method", "seed"],
-                                                           dropna=False)["delta_roc_auc"].mean().reset_index()
-            curves = across_runs(per_run, ["direction", "ess_level"], "delta_roc_auc")
-            per_pair: pandas.DataFrame = dependence[dependence["method"].isin(["multi", "single"])].groupby(
-                ["direction", "ess_level", "scenario", "method"])["delta_roc_auc"].mean().unstack("method")
-            differences: pandas.DataFrame = pandas.DataFrame()
-            if {"multi", "single"} <= set(per_pair.columns):
-                differences = (per_pair["multi"] - per_pair["single"]).rename("difference").reset_index()
-            plot_dependence_shift_summary(curves, differences, levels, styles,
-                                          os.path.join(directory, "robustness_dependence.png"),
-                                          f"Dependence shifts: change of test ROC-AUC over the pairs usable at every "
-                                          f"level ({n_common.get('decorrelate', 0)} decorrelated, "
-                                          f"{n_common.get('strengthen', 0)} strengthened; a direction with fewer than "
-                                          f"{config.min_pairs} is left out)\nmean over runs, band = SD across runs")
+        # dependence: the same cohort as the report and the tests
+        curves, differences, sizes = _dependence_plot_data(scenarios, reweighting_scores, config)
+        if not curves.empty:
+            plot_dependence_shift_summary(
+                curves, differences, {"weaken": config.dependence_weaken_levels,
+                                      "strengthen": config.dependence_strengthen_levels},
+                styles, os.path.join(directory, "robustness_dependence.png"),
+                f"Dependence shifts: change of test ROC-AUC over the pairs usable at every level "
+                f"({sizes.get('weaken', 0)} weakened, {sizes.get('strengthen', 0)} strengthened; a direction with "
+                f"fewer than {config.min_pairs} is left out)\nmean over runs, band = SD across runs")
 
     if not corruption_scores.empty:
         per_run = corruption_scores.groupby(["family", "level", "method", "seed"], dropna=False)[
@@ -742,11 +841,9 @@ def _figures(directory: str, config: RobustnessConfig, scenarios: pandas.DataFra
         clean_stats: pandas.DataFrame = across_runs(clean_per_model, [], "clean_roc_auc").set_index("method")
         overview_labels: dict[str, str] = {}
         for family in [f for f in FAMILY_ORDER if f in set(family_scores["family"])]:
-            reweighting: bool = family in REWEIGHTING_FAMILIES
-            severity: float = config.headline_ess if reweighting else config.headline_corruption_level
+            severity: float = headline_level(family, config)
             score, _, description = headline_statistic(family)
-            overview_labels[family] = (f"{FAMILY_LABELS[family]} ({description}, "
-                                       + (f"ESS {severity:.0%})" if reweighting else f"level {severity:g})"))
+            overview_labels[family] = f"{FAMILY_LABELS[family]} ({description}, {severity_text(family, severity)})"
             part: pandas.DataFrame = family_scores[(family_scores["family"] == family)
                                                    & numpy.isclose(family_scores["severity"].astype(float), severity)]
             for method, group in part.groupby("method"):
@@ -784,8 +881,10 @@ def _report_lines(summary: pandas.DataFrame, tests: pandas.DataFrame, sign_summa
     lines.append("\nTest ROC-AUC under stress, mean over runs, with its change from each model's clean score. A family")
     lines.append("is summarised by its worst scenario (population shifts) or by the mean over its pairs / corruption")
     lines.append("bank (the others). MORSE-SOGA: difference of that change, paired over the runs (> 0: MORSE loses")
-    lines.append("less), Wilcoxon p, and the runs in which MORSE is better; n = usable scenarios (re-weighting) or")
-    lines.append("corrupted test sets per level (corruption). clean ROC-AUC: "
+    lines.append("less), Wilcoxon p, and the runs in which MORSE is better. n = the family's cohort -- the scenarios")
+    lines.append("usable at EVERY level, the same at each level (re-weighting) -- or the corrupted test sets per level.")
+    lines.append("Severity: population = training ESS; dependence = share of the pair's correlation removed (r -) or")
+    lines.append("added (r +); corruption = level. clean ROC-AUC: "
                  + ", ".join(f"{METHOD_STYLES[m][0]} {summary.loc[summary['method'] == m, 'clean_roc_auc'].iloc[0]:.3f}"
                              for m in METHODS if (summary["method"] == m).any()))
     header: str = (f"{'family':32s} {'severity':>8s} {'n':>4s} "
@@ -805,12 +904,15 @@ def _report_lines(summary: pandas.DataFrame, tests: pandas.DataFrame, sign_summa
         comparison: str = (f"{test['mean_difference'].iloc[0]:+11.4f} {_format_p(test['p_value'].iloc[0]):>7s} "
                            f"{int(test['n_morse_better'].iloc[0]):>3d}/{int(test['n_runs'].iloc[0]):<2d}"
                            if not test.empty else "")
-        severity_text: str = f"{severity:.0%} ESS" if family in REWEIGHTING_FAMILIES else f"{severity:g}"
-        lines.append(f"{FAMILY_LABELS.get(family, family):32s} {severity_text:>8s} {int(part['n_scenarios'].max()):>4d} "
-                     + " ".join(f"{cell:>14s}" for cell in cells) + " " + comparison)
-    for _, row in skipped.iterrows():
-        lines.append(f"{FAMILY_LABELS.get(row['family'], row['family']):32s} {row['severity']:.0%} ESS "
-                     f"{int(row['n_scenarios']):>4d}   not summarised: fewer than {config.min_pairs} usable pairs")
+        lines.append(f"{FAMILY_LABELS.get(family, family):32s} {severity_text(family, severity):>8s} "
+                     f"{int(part['n_scenarios'].max()):>4d} " + " ".join(f"{cell:>14s}" for cell in cells) + " "
+                     + comparison)
+    if not skipped.empty:
+        for family, part in skipped.groupby("family", sort=False):
+            lines.append(f"{FAMILY_LABELS.get(family, family):32s} not summarised: only {int(part['n_scenarios'].max())} "
+                         f"pairs are usable at every level (at least {config.min_pairs} needed)")
+    lines.append("Supplementary (not the main analysis): every scenario usable at each level, a different set per")
+    lines.append("level -- supplementary_per_level_summary.csv / supplementary_per_level_tests.csv.")
     if not sign_summary.empty:
         lines.append("\nSign consistency vs change of ROC-AUC across the GA models (headline severity; exploratory):")
         for _, row in sign_summary.iterrows():

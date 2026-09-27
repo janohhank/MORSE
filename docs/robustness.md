@@ -118,7 +118,7 @@ opposite directions along each axis, so a mean would net harmful shifts against 
 ### Dependence shifts
 
 For pairs of correlated inputs, the test population is re-weighted so that the pair becomes **less**
-dependent (*decorrelate*) or **more** dependent (*strengthen*), while each input keeps its location and
+dependent (*weaken*) or **more** dependent (*strengthen*), while each input keeps its location and
 spread.
 
 * **Pairs.** A fixed rule on the training correlations, identical for every method and seed: training
@@ -139,23 +139,45 @@ spread.
   A plain exp(s · z_a z_b) tilt, without the balancing terms, mostly moves the means instead: at a
   training ESS of 60% it shifted both means by up to 0.7–0.8 SD on College Scorecard and RadFusion
   pairs.
-* **Summary.** Each direction is its own family, summarised by the mean over its usable pairs. A
-  direction is summarised at a severity only when at least 10 pairs are usable there (`min_pairs`).
-  Strengthening an already strong dependence of two 0/1 inputs is often impossible with their
-  prevalences held fixed ("saturated"), so on RadFusion only a few strengthened pairs remain.
+* **Severity: how far the correlation moves.** The dependence the tilt changes is the correlation r of
+  the two scores on the training rows. A scenario sets it to a target, and the tilt strength that
+  reaches it is found by root finding (`calibrate_correlation`; the correlation of the balanced tilt
+  increases with the strength):
+  * **weaken**: r → (1 − share)·r for share = 25%, 50%, 75%, 100% (`dependence_weaken_levels`); 100%
+    makes the pair uncorrelated and no level goes beyond. An earlier version calibrated the
+    "decorrelation" to a training ESS instead and passed through zero: on the RadFusion run of
+    2026-09-26, 23 of the 31 pairs usable at ESS 60% ended with a correlation of the opposite sign, so the
+    family mixed weakening with reversal. A separate reversal family is not included: beyond −0.25·r it
+    needs extreme weights for nearly every pair (1 of 200 RadFusion and 37 of 200 College Scorecard pairs
+    remain supported at −0.5·r).
+  * **strengthen**: r → (1 + share)·r for share = 12.5%, 25%, 37.5%, 50% (`dependence_strengthen_levels`).
+    Strengthening costs far more re-weighting per unit of correlation than weakening, and |r| < 1.
+
+  Why not ESS here: with ESS as the severity and a stop at zero, most pairs are uncorrelated before the
+  strong levels are reached (RadFusion pairs become uncorrelated at a median training ESS of 85%, so
+  only 8 of 200 would still be "weakening" at 60%). Every scenario records its training / test ESS, its
+  target correlation and the correlation reached (scores on the training rows; raw values on the
+  training and the test rows). A scenario is **supported** if its training and test ESS are at least 30%
+  and every class keeps 20 effective test rows; a target the tilt cannot reach (the moments cannot be
+  balanced, or |r| would reach 1) is **unattainable**.
+* **Summary.** Each direction is its own family, summarised by the mean over its **cohort**: the pairs
+  usable at every level of the family (see Statistics). A family is summarised only if its cohort has at
+  least 10 pairs (`min_pairs`). On the paper runs the cohorts hold 199 weakened / 120 strengthened pairs
+  (RadFusion) and 112 / 130 (College Scorecard) of 200; the pairs a College Scorecard weakening cannot
+  make uncorrelated at 30% ESS are those with |r| 0.52–0.93.
 
 **Why this family matters for MORSE.** Re-weighting never changes P(y | x). A model whose coefficients
 are the true conditional effects stays the best ranker under any of these shifts, including a genuine
 suppressor whose coefficient sign differs from its marginal correlation. What re-weighting *can* expose
 are coefficients that only work through the training correlation: correlated inputs with large
-opposite-sign coefficients that cancel. Those break when a pair is decorrelated (rows in which the two
+opposite-sign coefficients that cancel. Those break when a pair is weakened (rows in which the two
 disagree get more weight), and matter less when the dependence is strengthened. The prediction to check
-is therefore: **MORSE should lose less than the SO-GA under decorrelation, not under strengthening.**
-Genuine suppressors push the other way, so the test can come out against MORSE.
+is therefore: **MORSE should lose less than the SO-GA when pairs are weakened, not when they are
+strengthened.** Genuine suppressors push the other way, so the test can come out against MORSE.
 
-### Severity: the effective sample size (ESS)
+### Severity of a population shift: the effective sample size (ESS)
 
-Every re-weighting is calibrated to a target **effective sample size on the training rows**:
+Every population shift is calibrated to a target **effective sample size on the training rows**:
 
 ESS = (Σw)² / Σw².
 
@@ -163,8 +185,8 @@ A weighted average over n rows is as precise as a plain average over ESS rows. E
 weights; the more unequal the weights, the smaller the ESS. The suite uses **ESS/n = 90%, 80%, 70%,
 60%** (`ess_levels`).
 
-**Why ESS, and what the numbers mean.** Every re-weighting statistic (a PC score, a distance, a product
-of two scores) is first mapped to normal scores under its training distribution. An exponential tilt
+**Why ESS, and what the numbers mean.** Every population statistic (a PC score, a distance) is first
+mapped to normal scores under its training distribution. An exponential tilt
 w ∝ exp(s·g) of a standard normal g then moves g by exactly s standard deviations and leaves
 ESS/n = exp(−s²). So one ESS level means the same shift size for every axis and every dataset, whatever
 the scale or distribution of the statistic:
@@ -186,13 +208,15 @@ calibrated (`calibrate_strengths`) and reported, but not used as the severity sc
 weighted AUC grows like 1/√ESS, and the test sets are small (136 rows on Arrhythmia, 190 on RadFusion).
 Below about 60% the smaller test sets run out of effective rows per class. The suite therefore evaluates
 the whole grid and draws curves over it, so the conclusion can be checked for stability across the
-levels. The overview figure and the sign-consistency analysis use 60% (`headline_ess`).
+levels. The overview figure and the sign-consistency analysis use 60% (`headline_ess`), the weakening
+to uncorrelated pairs (`headline_weaken`) and +50% (`headline_strengthen`).
 
 **Support on the test set.** The ESS is calibrated on the training rows, but the test rows are what is
 scored. A scenario counts as *supported* if the re-weighted test rows keep at least 30% of the rows as
-ESS and at least 20 effective rows in each class. A *saturated* scenario cannot reach its target on
-the training rows (or its moments cannot be balanced there). Unsupported and saturated scenarios are
-reported in `scenarios.csv` but left out of the summaries.
+ESS and at least 20 effective rows in each class (and, for a dependence shift, the training rows at
+least 30%). An *unattainable* scenario cannot reach its target on the training rows (or its moments
+cannot be balanced there). A scenario that is both attainable and supported is *usable*.
+`scenarios.csv` reports every scenario with these flags; the summaries use the cohorts below.
 
 ### Metrics under re-weighting
 
@@ -231,10 +255,19 @@ every seed, that band was pure corruption noise. The bank separates the two.
 
 ## Statistics
 
+* **One cohort per family.** Every re-weighting family is summarised over the scenarios usable at
+  **every** level of the family — the same population axis-directions, the same dependence pairs — so
+  the curves across the levels, `summary.csv`, `tests.csv`, the figures and the report all describe the
+  same scenarios. Earlier, the report used every pair usable at a level while the figure used the pairs
+  usable at all levels; on the RadFusion run of 2026-09-26 the report's MORSE − SO-GA difference at ESS
+  90% (+0.0015, p = 0.006, 191 pairs) came from pairs that dropped out at stronger levels, and the plotted
+  pairs showed +0.0001 (p = 0.90, 31 pairs). The per-level cohorts (every scenario usable at a level, a
+  different set per level) are written separately as `supplementary_per_level_summary.csv` /
+  `supplementary_per_level_tests.csv`, labelled as supplementary.
 * **Unit of replication: the GA run (seed).** For every family and severity each model gets one number:
-  the worst usable scenario (population shifts), the mean over the usable pairs (dependence), or the
-  mean over the corruption bank (corruption). Corruption repetitions are averaged *within* a run before
-  runs are compared; they are never treated as extra runs.
+  the worst scenario of the cohort (population shifts), the mean over the cohort's pairs (dependence),
+  or the mean over the corruption bank (corruption). Corruption repetitions are averaged *within* a run
+  before runs are compared; they are never treated as extra runs.
 * **MORSE vs SO-GA:** paired two-sided Wilcoxon signed-rank test over the seeds, on the change from each
   model's clean score and on the stressed score itself. **MORSE vs SFS / all features:** the one-sample
   test of MORSE's seeds against the baseline's single value. A positive difference means MORSE is
@@ -257,16 +290,17 @@ every seed, that band was pure corruption noise. The bank separates the two.
 | `config.json` | the settings, the git commit, source hashes, the training fingerprint's hash |
 | `schema.json` | the inferred feature schema: types, one-hot groups, availability pairs (by name / statistically), unresolved pairs, unseen combinations |
 | `models.csv` | every final model: size, sign consistency, clean ROC-AUC / PR-AUC |
-| `scenarios.csv` | every re-weighting scenario: strength, training/test/per-class ESS, support, saturation, and what actually moved (statistic shift, correlation before/after, mean shifts, SD ratios, balance error) |
+| `scenarios.csv` | every re-weighting scenario: level, strength, training/test/per-class ESS, `attainable` / `supported` / `usable` / `in_cohort`, and what actually moved (statistic shift; for a pair the target and reached score correlation and the raw correlation before/after on the training and test rows, mean shifts, SD ratios, balance error) |
 | `reweighting_scores.csv`, `corruption_scores.csv` | every model under every scenario / corrupted test set |
 | `corruption_diagnostics.csv` | what every corrupted test set changed, and the unseen 0/1 combinations it created |
-| `model_family_scores.csv` | every model per family and severity (`summarised` = False: too few usable pairs) |
-| `summary.csv` | per family, severity and method: stressed score, change, SDs, worst case, clean score |
-| `tests.csv` | MORSE against every baseline |
+| `model_family_scores.csv` | every model per family and severity, over the family's cohort (`summarised` = False: the cohort has too few pairs) |
+| `summary.csv` | per family, severity and method: stressed score, change, SDs, worst case, clean score (cohorts) |
+| `tests.csv` | MORSE against every baseline (cohorts) |
+| `supplementary_per_level_summary.csv`, `supplementary_per_level_tests.csv` | the same for the re-weighting families over every scenario usable at each level (supplementary) |
 | `sign_vs_degradation.csv` (+ `_points.csv`) | the exploratory sign-consistency analysis |
 | `report.txt` | the printed report |
 | `robustness_population.png` | ROC-AUC along every population axis, both directions |
-| `robustness_dependence.png` | mean change under decorrelation / strengthening, and MORSE − SO-GA per pair |
+| `robustness_dependence.png` | mean change of the cohort when pairs are weakened / strengthened, and MORSE − SO-GA per pair |
 | `robustness_corruption.png` | ROC-AUC against the corruption level, per family |
 | `robustness_overview.png` | clean vs stressed ROC-AUC per family at the headline severity |
 | `robustness_sign_vs_degradation.png` | sign consistency vs change, marker size = model size |
@@ -279,7 +313,9 @@ every seed, that band was pure corruption noise. The bank separates the two.
   (`college_scorecard/college_scorecard_ood_evaluation.py`), or a synthetic dataset with a known outcome
   mechanism.
 * On small test sets many dependence scenarios are not supported (Arrhythmia), and strengthening 0/1
-  pairs is often saturated (RadFusion). The report shows how many pairs each summary rests on.
+  pairs is often unattainable (RadFusion); weakening a strongly correlated pair to independence can need
+  more re-weighting than the support rule allows (College Scorecard). The report shows how many pairs
+  each cohort holds.
 * One-hot groups are only found for pandas-style `<prefix>_<level>` names, and availability flags by name
   only for `<stem><sep><suffix>` names; other flags depend on the statistical rules. Genuine
   impossibilities other than those two structures (e.g. a sex-specific code) are not known to the suite:

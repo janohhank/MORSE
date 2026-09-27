@@ -101,7 +101,7 @@ class SuiteTests(unittest.TestCase):
     def test_scenarios_and_families(self):
         scenarios = self.results.scenarios
         self.assertEqual(int((scenarios["family"] == "population").sum()), 8)       # 4 axes x 2 directions x 1 level
-        self.assertLessEqual(int(scenarios["family"].str.startswith("dependence_").sum()), 10)
+        self.assertLessEqual(int(scenarios["family"].str.startswith("dependence_").sum()), 5 * 8)   # pairs x levels
         families = set(self.results.summary["family"])
         self.assertTrue({"population", "gaussian_noise", "binary_redraw", "under_recording",
                          "value_masking"} <= families)
@@ -399,10 +399,23 @@ class HelperTests(unittest.TestCase):
         summary = pandas.DataFrame([{"family": "gaussian_noise", "severity": 0.5, "method": method,
                                      "clean_roc_auc": 0.8, "roc_auc": 0.75, "delta_roc_auc": -0.05, "n_scenarios": 10}
                                     for method in ("multi", "single")])
-        skipped = pandas.DataFrame([{"family": "dependence_strengthen", "severity": 0.6, "n_scenarios": 2}])
+        skipped = pandas.DataFrame([{"family": "dependence_strengthen", "n_scenarios": 2}])
         lines = evaluation._report_lines(summary, pandas.DataFrame(), pandas.DataFrame(), skipped, RobustnessConfig())
-        self.assertTrue(any("not summarised: fewer than 10 usable pairs" in line for line in lines))
+        self.assertTrue(any("not summarised: only 2 pairs are usable at every level (at least 10 needed)" in line
+                            for line in lines))
         self.assertTrue(any(line.startswith("Measurement noise") for line in lines))
+
+    def test_severity_names_and_levels(self):
+        config = RobustnessConfig()
+        self.assertEqual(evaluation.severity_text("population", 0.6), "60% ESS")
+        self.assertEqual(evaluation.severity_text("dependence_weaken", 1.0), "r -100%")
+        self.assertEqual(evaluation.severity_text("dependence_strengthen", 0.125), "r +12.5%")
+        self.assertEqual(evaluation.severity_text("value_masking", 0.5), "0.5")
+        self.assertEqual(evaluation.family_levels("dependence_weaken", config), (0.25, 0.5, 0.75, 1.0))
+        self.assertEqual(evaluation.family_levels("gaussian_noise", config), config.corruption_levels)
+        self.assertEqual([evaluation.headline_level(f, config) for f in
+                          ("population", "dependence_weaken", "dependence_strengthen", "binary_redraw")],
+                         [0.6, 1.0, 0.5, 0.5])
 
     def test_provenance(self):
         with mock.patch.object(evaluation.subprocess, "run", side_effect=OSError("no git")):
@@ -480,12 +493,87 @@ class SaturatedPopulationTests(unittest.TestCase):
         scenarios = results.scenarios.set_index("scenario_id")
         # tilting towards the 70% of rows with b = 1 can never leave less than 70% ESS
         saturated = scenarios.loc["population|PC1|+|0.6"]
-        self.assertTrue(saturated["saturated"])
-        self.assertFalse(saturated["supported"])
+        self.assertFalse(saturated["attainable"])
+        self.assertFalse(saturated["supported"] or saturated["usable"])
         self.assertTrue(numpy.isnan(saturated["strength"]))
         self.assertNotIn("population|PC1|+|0.6", set(scores["scenario_id"]))
-        self.assertFalse(scenarios.loc["population|PC1|+|0.8", "saturated"])
+        self.assertTrue(scenarios.loc["population|PC1|+|0.8", "attainable"])
         self.assertIn("population|PC1|+|0.8", set(scores["scenario_id"]))
+        # the direction that cannot reach 60% is out of the population cohort at every level, so the
+        # main summary does not compare "PC1 +" at 80% with a set of scenarios that lacks it at 60%
+        self.assertFalse(scenarios.loc["population|PC1|+|0.8", "in_cohort"])
+        self.assertTrue(scenarios.loc["population|PC1|-|0.8", "in_cohort"])
+
+
+class CohortTests(unittest.TestCase):
+    """Review point 6: the report, the tests and the figures summarise the same scenarios -- the cohort
+    usable at every level -- while every scenario usable at a level goes to a supplementary table."""
+
+    @classmethod
+    def setUpClass(cls):
+        X, y = make_data(1500, seed=91)
+        X_test, y_test = make_data(500, seed=92)
+        features = list(X.columns)
+        chosen = masks(len(features))
+        packages = {seed: {method: build_model_package(chosen[method][seed], features, X, pandas.Series(y), seed=seed)
+                           for method in ("multi", "single")} for seed in SEEDS}
+        cls.config = RobustnessConfig(ess_levels=(0.9, 0.6), headline_ess=0.6, corruption_levels=(0.5,),
+                                      headline_corruption_level=0.5, corruption_repetitions=1, min_pairs=1,
+                                      dependence_weaken_levels=(0.5, 1.0), headline_weaken=1.0,
+                                      dependence_strengthen_levels=(0.25, 0.5), headline_strengthen=0.5)
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.results = run_robustness_suite(X, y, X_test, y_test, packages, cls.directory.name, config=cls.config,
+                                           log=lambda line: None)
+        cls.scores = pandas.read_csv(os.path.join(cls.directory.name, "reweighting_scores.csv"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def test_weakening_reaches_its_target_and_never_reverses_the_dependence(self):
+        weakened = self.results.scenarios[(self.results.scenarios["family"] == "dependence_weaken")
+                                          & self.results.scenarios["attainable"]]
+        self.assertFalse(weakened.empty)
+        numpy.testing.assert_allclose(weakened["score_correlation_reached"], weakened["score_correlation_target"],
+                                      atol=1e-6)
+        self.assertTrue((weakened["score_correlation_reached"] * weakened["score_correlation_clean"] >= -1e-9).all())
+        full = weakened[weakened["level"] == 1.0]
+        numpy.testing.assert_allclose(full["score_correlation_reached"], 0.0, atol=1e-6)
+        strengthened = self.results.scenarios[(self.results.scenarios["family"] == "dependence_strengthen")
+                                              & self.results.scenarios["attainable"]]
+        numpy.testing.assert_allclose(strengthened["score_correlation_reached"],
+                                      strengthened["score_correlation_clean"] * (1 + strengthened["level"]), atol=1e-6)
+
+    def test_the_cohort_is_the_same_at_every_level(self):
+        scenarios = self.results.scenarios
+        for family, part in scenarios[scenarios["in_cohort"]].groupby("family"):
+            units = [set(level_part["unit"]) for _, level_part in part.groupby("level")]
+            self.assertTrue(all(u == units[0] for u in units), family)
+            self.assertTrue(part["usable"].all())
+        summary = self.results.summary
+        for family, part in summary[summary["family"].str.startswith("dependence_")].groupby("family"):
+            self.assertEqual(part["n_scenarios"].nunique(), 1)
+            self.assertEqual(int(part["n_scenarios"].iloc[0]),
+                             scenarios.loc[(scenarios["family"] == family) & scenarios["in_cohort"], "unit"].nunique())
+
+    def test_the_figure_shows_the_numbers_of_the_summary(self):
+        curves, _, _ = evaluation._dependence_plot_data(self.results.scenarios, self.scores, self.config)
+        self.assertFalse(curves.empty)
+        summary = self.results.summary.set_index(["family", "severity", "method"])
+        for _, row in curves.iterrows():
+            self.assertAlmostEqual(row["mean"], summary.loc[(f"dependence_{row['direction']}", row["level"],
+                                                             row["method"]), "delta_roc_auc"], places=12)
+
+    def test_the_per_level_cohort_is_supplementary(self):
+        supplementary = pandas.read_csv(os.path.join(self.directory.name, "supplementary_per_level_summary.csv"))
+        self.assertTrue(set(supplementary["family"]) <= set(evaluation.REWEIGHTING_FAMILIES))
+        usable = self.results.scenarios[self.results.scenarios["usable"]]
+        for (family, level), part in supplementary.groupby(["family", "severity"]):
+            expected = usable[(usable["family"] == family) & numpy.isclose(usable["level"], level)]["unit"].nunique()
+            self.assertEqual(int(part["n_scenarios"].max()), expected)
+        self.assertTrue(os.path.isfile(os.path.join(self.directory.name, "supplementary_per_level_tests.csv")))
+        self.assertIn("Cohorts -- the units usable at every level", self.results.report)
+        self.assertIn("Supplementary (not the main analysis)", self.results.report)
 
 
 if __name__ == "__main__":

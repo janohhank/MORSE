@@ -125,20 +125,24 @@ class RobustnessFigureTests(PlotTestCase):
         self.assertImage(self.path("population1.png"))
 
     def test_dependence_summary_with_both_directions_and_with_one_missing(self):
-        keys = [{"direction": d, "ess_level": level} for d in ("decorrelate", "strengthen") for level in LEVELS]
+        levels = {"weaken": (0.25, 0.5, 0.75, 1.0), "strengthen": (0.125, 0.25, 0.375, 0.5)}
+        keys = [{"direction": d, "level": level} for d in levels for level in levels[d]]
         curves = self.curves(keys, value=-0.01)
-        differences = pandas.DataFrame([{"direction": d, "ess_level": level, "scenario": f"p{i}",
+        differences = pandas.DataFrame([{"direction": d, "level": level, "unit": f"p{i}",
                                          "difference": 0.001 * (i - 3)}
-                                        for d in ("decorrelate", "strengthen") for level in LEVELS for i in range(8)])
-        plot_dependence_shift_summary(curves, differences, LEVELS, STYLES, self.path("dependence.png"), "t")
+                                        for d in levels for level in levels[d] for i in range(8)])
+        plot_dependence_shift_summary(curves, differences, levels, STYLES, self.path("dependence.png"), "t")
         self.assertImage(self.path("dependence.png"))
-        only_decorrelate = curves[curves["direction"] == "decorrelate"]
-        plot_dependence_shift_summary(only_decorrelate, differences[differences["direction"] == "decorrelate"],
-                                      LEVELS, STYLES, self.path("dependence1.png"), "t")
+        only_weaken = curves[curves["direction"] == "weaken"]
+        plot_dependence_shift_summary(only_weaken, differences[differences["direction"] == "weaken"],
+                                      levels, STYLES, self.path("dependence1.png"), "t")
         self.assertImage(self.path("dependence1.png"))
-        plot_dependence_shift_summary(only_decorrelate, pandas.DataFrame(), LEVELS,
+        plot_dependence_shift_summary(only_weaken, pandas.DataFrame(), levels,
                                       {k: STYLES[k] for k in ("multi", "single")}, self.path("dependence0.png"), "t")
         self.assertImage(self.path("dependence0.png"))
+        plot_dependence_shift_summary(pandas.DataFrame(), pandas.DataFrame(), {"weaken": (1.0,)}, STYLES,
+                                      self.path("dependence_none.png"), "t")
+        self.assertImage(self.path("dependence_none.png"))
 
     def test_corruption_curves(self):
         keys = [{"family": family, "level": level} for family in ("gaussian_noise", "binary_redraw", "value_masking")
@@ -165,7 +169,7 @@ class RobustnessFigureTests(PlotTestCase):
         self.assertImage(self.path("overview1.png"))
 
     def test_sign_vs_degradation_over_several_rows_of_panels(self):
-        families = ["population", "dependence_decorrelate", "gaussian_noise", "binary_redraw", "under_recording"]
+        families = ["population", "dependence_weaken", "gaussian_noise", "binary_redraw", "under_recording"]
         rng = numpy.random.default_rng(0)
         points = pandas.DataFrame([{"family": family, "method": method, "seed": seed,
                                     "sign_consistency": rng.uniform(0.6, 1.0), "n_features": rng.integers(5, 50),

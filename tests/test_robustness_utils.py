@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from robustness_config import RobustnessConfig  # noqa: E402
 from robustness_utils import (BALANCE_TOLERANCE, CorruptionBank, DependenceTilt, NormalScores,  # noqa: E402
-                              calibrate_strength, calibrate_strengths, class_effective_sizes, dependence_pairs,
+                              calibrate_correlation, calibrate_strength, calibrate_strengths,
+                              class_effective_sizes, dependence_pairs,
                               effective_sample_fraction, exponential_tilt, infer_feature_schema,
                               normalise_within_classes, population_axes, weighted_average_precision,
                               weighted_correlation, weighted_roc_auc)
@@ -333,7 +334,11 @@ class ConfigTests(unittest.TestCase):
             {"corruption_levels": (0.0, 0.5)}, {"corruption_levels": (0.5, 0.2), "headline_corruption_level": 0.5},
             {"headline_ess": 0.5}, {"headline_corruption_level": 0.55},
             {"pair_min_abs_correlation": 0.6, "pair_max_abs_correlation": 0.5},
-            {"corruption_repetitions": 0}, {"max_pairs": -1}, {"population_components": -1}]
+            {"corruption_repetitions": 0}, {"max_pairs": -1}, {"population_components": -1},
+            {"dependence_weaken_levels": ()}, {"dependence_weaken_levels": (0.5, 1.2)},
+            {"dependence_weaken_levels": (1.0, 0.5)}, {"dependence_strengthen_levels": (0.0, 0.5)},
+            {"dependence_strengthen_levels": (0.25, 0.25, 0.5)}, {"headline_weaken": 0.3},
+            {"headline_strengthen": 0.3}, {"min_train_ess_fraction": 0.0}]
         for settings in invalid:
             with self.assertRaises(ValueError, msg=str(settings)):
                 RobustnessConfig(**settings)
@@ -424,6 +429,60 @@ class UnbalanceableTiltTests(unittest.TestCase):
         self.assertTrue(numpy.isnan(tilt.train_ess(20.0)))             # strengthening that far does not
         self.assertGreater(tilt.balance_error, BALANCE_TOLERANCE)
         self.assertEqual(calibrate_strengths(tilt.train_ess, [0.8, 0.6]), [(20.0, True), (20.0, True)])
+
+
+class CorrelationCalibrationTests(unittest.TestCase):
+    """Dependence severities on the correlation scale (review point 5): weakening stops at zero."""
+
+    def setUp(self):
+        rng = numpy.random.default_rng(41)
+        x = rng.normal(size=2000)
+        z = 0.5 * x + 0.85 * rng.normal(size=2000)
+        self.tilt = DependenceTilt(x, z, x[:500], z[:500], False, False, clip=2.5)
+        self.clean = self.tilt.score_correlation(0.0)
+
+    def test_the_clean_score_correlation(self):
+        scores = self.tilt._train_stats[:, :2]
+        self.assertAlmostEqual(self.clean, float(numpy.corrcoef(scores.T)[0, 1]), places=12)
+        self.assertGreater(self.clean, 0.4)
+
+    def test_weakening_reaches_every_target_and_stops_at_zero(self):
+        targets = [0.75 * self.clean, 0.5 * self.clean, 0.25 * self.clean, 0.0]
+        results = calibrate_correlation(self.tilt, targets)
+        self.assertTrue(all(reached for _, reached in results))
+        strengths = [strength for strength, _ in results]
+        self.assertTrue(all(s < 0 for s in strengths))                         # a positive r is lowered
+        self.assertEqual(strengths, sorted(strengths, reverse=True))           # further = stronger
+        for (strength, _), target in zip(results, targets):
+            self.assertAlmostEqual(self.tilt.score_correlation(strength), target, delta=1e-6)
+
+    def test_an_impossible_strengthening_is_unattainable(self):
+        results = calibrate_correlation(self.tilt, [1.2 * self.clean, 0.9999])
+        self.assertTrue(results[0][1])
+        self.assertAlmostEqual(self.tilt.score_correlation(results[0][0]), 1.2 * self.clean, delta=1e-6)
+        self.assertFalse(results[1][1])
+        self.assertTrue(numpy.isnan(results[1][0]))
+
+    def test_invalid_targets(self):
+        self.assertEqual(calibrate_correlation(self.tilt, []), [])
+        with self.assertRaises(ValueError):
+            calibrate_correlation(self.tilt, [0.5 * self.clean, 0.8 * self.clean])      # moving back
+        with self.assertRaises(ValueError):
+            calibrate_correlation(self.tilt, [0.5 * self.clean, 1.2 * self.clean])      # both sides
+        with self.assertRaises(ValueError):
+            calibrate_correlation(self.tilt, [self.clean])                              # no move at all
+
+    def test_a_target_the_balancing_cannot_reach(self):
+        rng = numpy.random.default_rng(0)
+        a = rng.integers(0, 10, 400).astype(float)
+        b = numpy.round(a + rng.normal(scale=0.3, size=a.size))       # score correlation 0.990, ten values
+        tilt = DependenceTilt(a, b, a, b, False, False, clip=2.5)
+        self.assertAlmostEqual(tilt.score_correlation(0.0), 0.990, delta=0.001)
+        strength, reached = calibrate_correlation(tilt, [0.995])[0]
+        self.assertFalse(reached)
+        self.assertTrue(numpy.isnan(strength))
+        at_most: float = tilt.score_correlation(20.0)                   # the strongest tilt stays short of it
+        self.assertTrue(numpy.isnan(at_most) or at_most < 0.995)
 
 
 class CorruptionBankErrorTests(unittest.TestCase):

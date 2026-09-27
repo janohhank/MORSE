@@ -14,7 +14,7 @@ from typing import Any
 @dataclass(frozen=True)
 class RobustnessConfig:
     # ---- Re-weighted test populations (population and dependence shifts) --------------------------------
-    # Severity of a re-weighting = the effective sample size (ESS) it leaves on the TRAINING rows, as a
+    # Severity of a POPULATION shift = the effective sample size (ESS) it leaves on the TRAINING rows, as a
     # fraction of the rows. ESS = (sum w)^2 / sum(w^2): a weighted average over the rows is as precise as
     # a plain average over ESS rows. For an exponential tilt of a normal-scored statistic,
     # ESS / n = exp(-strength^2), and the tilt moves that statistic by `strength` standard deviations:
@@ -36,17 +36,28 @@ class RobustnessConfig:
     pair_min_train_count: int = 20
     pair_min_test_count: int = 5
     max_pairs: int = 200
+    # Severity of a DEPENDENCE shift = how far the pair's correlation (of the scores the tilt uses) moves
+    # on the TRAINING rows, as a share of its clean value r:
+    #   weakening:     r -> (1 - share) r; share 1 = the pair made uncorrelated, never beyond (a reversal
+    #                  of the correlation beyond -0.25 r needs extreme weights for almost every pair);
+    #   strengthening: r -> (1 + share) r; strengthening needs far more re-weighting per unit of
+    #                  correlation than weakening (and |r| < 1), hence the smaller shares.
+    # The ESS each scenario costs is recorded with it.
+    dependence_weaken_levels: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+    dependence_strengthen_levels: tuple[float, ...] = (0.125, 0.25, 0.375, 0.5)
     # Continuous inputs enter a dependence tilt as normal scores clipped to +-score_clip, so that a few
     # extreme test rows cannot take all the weight.
     score_clip: float = 2.5
-    # A scenario counts as SUPPORTED by the test set if the re-weighted test rows keep at least this
-    # share of the rows as ESS and this many effective rows in each class; unsupported scenarios are
+    # A scenario is SUPPORTED if the re-weighted test rows keep at least this share of the rows as ESS and
+    # this many effective rows in each class, and -- for a dependence shift, whose severity is not an ESS
+    # -- the re-weighted training rows at least `min_train_ess_fraction`. Unsupported scenarios are
     # reported but left out of the summaries.
     min_test_ess_fraction: float = 0.3
     min_class_ess: float = 20.0
-    # A dependence family is summarised at a severity only if at least this many pairs are usable there
-    # (supported and not saturated). Strengthening an already strong dependence of two 0/1 inputs is often
-    # impossible with their prevalences held fixed, so on data with many 0/1 inputs few pairs may remain.
+    min_train_ess_fraction: float = 0.3
+    # Every family is summarised over ONE cohort: the scenarios (population axis and direction, dependence
+    # pair) usable at EVERY level of the family, so that the curves and the tests across the levels compare
+    # the same scenarios. A dependence family is summarised only if its cohort has at least this many pairs.
     min_pairs: int = 10
 
     # ---- Corrupted test sets ------------------------------------------------------------------------------
@@ -86,6 +97,8 @@ class RobustnessConfig:
     # The severities used for the overview figure and the sign-consistency analysis; the CSV summaries
     # and tests cover every level.
     headline_ess: float = 0.6
+    headline_weaken: float = 1.0
+    headline_strengthen: float = 0.5
     headline_corruption_level: float = 0.5
 
     def __post_init__(self) -> None:
@@ -93,6 +106,20 @@ class RobustnessConfig:
             raise ValueError(f"ess_levels must lie in (0, 1), got {self.ess_levels}")
         if list(self.ess_levels) != sorted(self.ess_levels, reverse=True):
             raise ValueError(f"ess_levels must be in decreasing order (milder first), got {self.ess_levels}")
+        for name, levels, upper in (("dependence_weaken_levels", self.dependence_weaken_levels, 1.0),
+                                    ("dependence_strengthen_levels", self.dependence_strengthen_levels, None)):
+            if not levels or any(level <= 0.0 or (upper is not None and level > upper) for level in levels):
+                raise ValueError(f"{name} must be positive shares" + (" of at most 1" if upper else "")
+                                 + f", got {levels}")
+            if list(levels) != sorted(levels) or len(set(levels)) != len(levels):
+                raise ValueError(f"{name} must be increasing (milder first), got {levels}")
+        if self.headline_weaken not in self.dependence_weaken_levels:
+            raise ValueError(f"headline_weaken {self.headline_weaken} is not one of dependence_weaken_levels")
+        if self.headline_strengthen not in self.dependence_strengthen_levels:
+            raise ValueError(f"headline_strengthen {self.headline_strengthen} is not one of "
+                             f"dependence_strengthen_levels")
+        if not 0.0 < self.min_train_ess_fraction <= 1.0:
+            raise ValueError(f"min_train_ess_fraction must lie in (0, 1], got {self.min_train_ess_fraction}")
         if any(not 0.0 < level <= 1.0 for level in self.corruption_levels):
             raise ValueError(f"corruption_levels must lie in (0, 1], got {self.corruption_levels}")
         if list(self.corruption_levels) != sorted(self.corruption_levels):

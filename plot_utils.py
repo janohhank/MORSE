@@ -17,7 +17,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 import seaborn as sns
 
 from training_utils import (
@@ -267,38 +266,47 @@ def plot_population_shift_curves(curves: pandas.DataFrame,
 
 def plot_dependence_shift_summary(curves: pandas.DataFrame,
                                   differences: pandas.DataFrame,
-                                  ess_levels: Sequence[float],
+                                  levels: dict[str, Sequence[float]],
                                   method_styles: dict[str, tuple[str, str, str, str]],
                                   out_path: str,
                                   title: str) -> None:
-    """Dependence shifts in three panels. Left and middle: the change of test ROC-AUC, averaged over the
-    pairs given in `curves`, when the pairs are decorrelated / strengthened, against the training ESS of the
-    re-weighting (mean over runs; band = SD across runs). Right: for every pair, MORSE's change minus the
-    SO-GA's change (each averaged over the runs) -- above zero, MORSE lost less on that pair; the share
-    of pairs above zero is printed over each box.
+    """Dependence shifts, one row per direction (weakened / strengthened pairs). Left: the change of test
+    ROC-AUC, averaged over the pairs of `curves`, against the share of the pair's correlation removed /
+    added (mean over runs; band = SD across runs). Right: for every pair, MORSE's change minus the SO-GA's
+    change (each averaged over the runs) -- above zero, MORSE lost less on that pair; the share of pairs
+    above zero is printed over each box.
 
     Parameters
     ----------
     curves
-        Columns `direction` ("decorrelate" / "strengthen"), `ess_level`, `method`, `mean`, `sd`.
+        Columns `direction` ("weaken" / "strengthen"), `level`, `method`, `mean`, `sd`.
     differences
-        Columns `direction`, `ess_level`, `scenario`, `difference` (may be empty).
+        Columns `direction`, `level`, `unit`, `difference` (may be empty).
+    levels
+        The levels of each direction, mildest first.
     """
     ensure_directory(os.path.dirname(out_path))
     _apply_plot_theme()
-    fig, axes = plt.subplots(1, 3, figsize=(19, 5.4))
-    rank: dict[float, int] = {level: i + 1 for i, level in enumerate(ess_levels)}
-    tick_labels: list[str] = ["clean"] + [f"{level:.0%}" for level in ess_levels]
-    for ax, direction in zip(axes[:2], ("decorrelate", "strengthen")):
-        part: pandas.DataFrame = curves[curves["direction"] == direction]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10), squeeze=False)
+    titles: dict[str, str] = {"weaken": "Pairs weakened", "strengthen": "Pairs strengthened"}
+    xlabels: dict[str, str] = {"weaken": "Share of the pair's correlation removed (100% = uncorrelated)",
+                               "strengthen": "Share of the pair's correlation added"}
+    box_colours: dict[str, str] = {"weaken": "#6baed6", "strengthen": "#fd8d3c"}
+    for row, direction in enumerate(("weaken", "strengthen")):
+        direction_levels: list[float] = list(levels.get(direction, ()))
+        rank: dict[float, int] = {level: i + 1 for i, level in enumerate(direction_levels)}
+        labels: list[str] = [f"{100 * level:g}%" for level in direction_levels]
+        ax = axes[row, 0]
+        part: pandas.DataFrame = curves[curves["direction"] == direction] if not curves.empty else curves
         if part.empty:
-            ax.text(0.5, 0.5, "too few pairs are usable\nat every level", transform=ax.transAxes,
-                    ha="center", va="center", color="gray")
+            for panel in axes[row]:
+                panel.text(0.5, 0.5, "too few pairs are usable\nat every level", transform=panel.transAxes,
+                           ha="center", va="center", color="gray")
         for method, (label, colour, marker, linestyle) in method_styles.items():
-            line: pandas.DataFrame = part[part["method"] == method]
+            line: pandas.DataFrame = part[part["method"] == method] if not part.empty else part
             if line.empty:
                 continue
-            x: numpy.ndarray = numpy.r_[0, line["ess_level"].map(rank).to_numpy(dtype=float)]
+            x: numpy.ndarray = numpy.r_[0, line["level"].map(rank).to_numpy(dtype=float)]
             order: numpy.ndarray = numpy.argsort(x)
             mean: numpy.ndarray = numpy.r_[0.0, line["mean"].to_numpy(dtype=float)][order]
             sd: numpy.ndarray = numpy.r_[0.0, line["sd"].fillna(0.0).to_numpy(dtype=float)][order]
@@ -306,51 +314,40 @@ def plot_dependence_shift_summary(curves: pandas.DataFrame,
             if line["sd"].notna().any():
                 ax.fill_between(x[order], mean - sd, mean + sd, color=colour, alpha=0.15)
         ax.axhline(0.0, color="black", linewidth=0.8)
-        ax.set_xticks(numpy.arange(len(tick_labels)))
-        ax.set_xticklabels(tick_labels)
-        ax.set_title({"decorrelate": "Pairs decorrelated", "strengthen": "Pairs strengthened"}[direction],
-                     fontweight="bold")
-        ax.set_xlabel("Training ESS of the re-weighting", fontweight="bold")
+        ax.set_xticks(numpy.arange(len(direction_levels) + 1))
+        ax.set_xticklabels(["clean"] + labels)
+        ax.set_title(titles[direction], fontweight="bold")
+        ax.set_xlabel(xlabels[direction], fontweight="bold")
         ax.set_ylabel("Change of test ROC-AUC\n(mean over the pairs)", fontweight="bold")
         ax.grid(True, alpha=0.3)
 
-    ax = axes[2]
-    box_colours: dict[str, str] = {"decorrelate": "#6baed6", "strengthen": "#fd8d3c"}
-    drawn: list[str] = []
-    if not differences.empty:
-        for direction, offset in (("decorrelate", -0.18), ("strengthen", 0.18)):
-            for level in ess_levels:
+        ax = axes[row, 1]
+        if not differences.empty:
+            for level in direction_levels:
                 values: numpy.ndarray = differences.loc[
-                    (differences["direction"] == direction) & numpy.isclose(differences["ess_level"], level),
+                    (differences["direction"] == direction) & numpy.isclose(differences["level"], level),
                     "difference"].dropna().to_numpy(dtype=float)
                 if values.size == 0:
                     continue
-                position: float = rank[level] + offset
-                if direction not in drawn:
-                    drawn.append(direction)
-                boxes = ax.boxplot([values], positions=[position], widths=0.3, patch_artist=True,
+                boxes = ax.boxplot([values], positions=[rank[level]], widths=0.5, patch_artist=True,
                                    showfliers=True, flierprops={"markersize": 3})
                 for patch in boxes["boxes"]:
                     patch.set_facecolor(box_colours[direction])
                     patch.set_alpha(0.8)
-                ax.annotate(f"{(values > 0).mean():.0%}", xy=(position, float(numpy.max(values))),
+                ax.annotate(f"{(values > 0).mean():.0%}", xy=(rank[level], float(numpy.max(values))),
                             xytext=(0, 4), textcoords="offset points", ha="center", fontsize=8)
-        box_labels: dict[str, str] = {"decorrelate": "pairs decorrelated", "strengthen": "pairs strengthened"}
-        if drawn:
-            ax.legend(handles=[Patch(facecolor=box_colours[d], label=box_labels[d]) for d in drawn],
-                      loc="best", fontsize=8)
-    ax.axhline(0.0, color="black", linewidth=0.8)
-    ax.set_xticks(numpy.arange(1, len(ess_levels) + 1))
-    ax.set_xticklabels([f"{level:.0%}" for level in ess_levels])
-    ax.set_xlim(0.4, len(ess_levels) + 0.6)
-    ax.set_title("MORSE minus SO-GA, per pair", fontweight="bold")
-    ax.set_xlabel("Training ESS of the re-weighting", fontweight="bold")
-    ax.set_ylabel("Difference of the change of ROC-AUC\n(> 0: MORSE loses less)", fontweight="bold")
-    ax.grid(True, alpha=0.3)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_xticks(numpy.arange(1, len(direction_levels) + 1))
+        ax.set_xticklabels(labels)
+        ax.set_xlim(0.4, len(direction_levels) + 0.6)
+        ax.set_title(f"{titles[direction]}: MORSE minus SO-GA, per pair", fontweight="bold")
+        ax.set_xlabel(xlabels[direction], fontweight="bold")
+        ax.set_ylabel("Difference of the change of ROC-AUC\n(> 0: MORSE loses less)", fontweight="bold")
+        ax.grid(True, alpha=0.3)
 
     fig.legend(handles=_method_handles(method_styles), loc="lower center", ncol=len(method_styles), frameon=True)
     fig.suptitle(title, fontweight="bold")
-    fig.tight_layout(rect=(0, 0.08, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 

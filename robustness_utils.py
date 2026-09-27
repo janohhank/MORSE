@@ -760,6 +760,8 @@ class DependenceTilt:
             hessian: numpy.ndarray = centred.T @ (centred * w[:, None])
             step: numpy.ndarray = numpy.linalg.lstsq(hessian, gradient, rcond=None)[0]
             decrease: float = float(gradient @ step)
+            if decrease < 1e-18:            # the Newton decrement is at the rounding level: at the optimum
+                break
             t: float = 1.0
             while True:
                 candidate: numpy.ndarray = lam - t * step
@@ -787,6 +789,18 @@ class DependenceTilt:
         w_train, _ = self.weights(strength)
         return effective_sample_fraction(w_train) if self.balance_error <= BALANCE_TOLERANCE else float("nan")
 
+    def score_correlation(self, strength: float) -> float:
+        """Correlation of the two scores on the training rows re-weighted at `strength` -- the dependence
+        the tilt moves -- or NaN when the moments cannot be balanced there. With the means (and second
+        moments) of the scores held at their clean values it is a linear function of the product moment,
+        so it increases with the strength."""
+        w_train, _ = self.weights(strength)
+        if self.balance_error > BALANCE_TOLERANCE:
+            return float("nan")
+        a: numpy.ndarray = self._train_stats[:, 0]
+        b: numpy.ndarray = self._train_stats[:, 1]
+        return weighted_correlation(a, b, w_train)
+
     def weights(self, strength: float) -> tuple[numpy.ndarray, numpy.ndarray]:
         """(training weights, test weights), each scaled to mean 1."""
         lam: numpy.ndarray = self._solve(strength)
@@ -795,6 +809,49 @@ class DependenceTilt:
         w_train: numpy.ndarray = numpy.exp(train - train.max())
         w_test: numpy.ndarray = numpy.exp(test - test.max())
         return w_train / w_train.mean(), w_test / w_test.mean()
+
+
+def calibrate_correlation(tilt: DependenceTilt, targets: Sequence[float],
+                          max_strength: float = MAX_TILT_STRENGTH,
+                          initial_strength: float = 0.05) -> list[tuple[float, bool]]:
+    """(strength, reached) for every target training score correlation of `tilt`, in the given order --
+    each target further from the clean correlation than the one before, all on one side of it. The
+    strength is searched from 0 towards the target (doubling until the correlation passes it), then
+    refined by root finding, starting each target from the previous one's strength.
+
+    `reached` is False when the target cannot be realised: the moments cannot be balanced before it, or
+    even `max_strength` stays short of it; that target -- and every further one -- gets NaN."""
+    clean: float = tilt.score_correlation(0.0)
+    if not targets:
+        return []
+    direction: float = 1.0 if targets[0] > clean else -1.0
+    steps: list[float] = [direction * (target - clean) for target in targets]
+    if any(step <= 0.0 for step in steps) or steps != sorted(steps):
+        raise ValueError(f"the targets must move away from the clean correlation {clean:.4f} in one direction, "
+                         f"got {list(targets)}")
+    results: list[tuple[float, bool]] = []
+    low: float = 0.0
+    for target in targets:
+        def progress(s: float, goal: float = target) -> float:
+            # < 0 until the correlation has moved past the goal; NaN where the tilt cannot be balanced
+            value: float = tilt.score_correlation(direction * s)
+            return float("nan") if numpy.isnan(value) else direction * (value - goal)
+
+        high: float = max(low, initial_strength)
+        value_high: float = progress(high)
+        while not numpy.isnan(value_high) and value_high < 0.0 and high < max_strength:
+            low, high = high, min(2.0 * high, max_strength)
+            value_high = progress(high)
+        try:
+            if numpy.isnan(value_high) or value_high < 0.0:
+                raise ValueError("the target is not reached")
+            strength: float = float(brentq(progress, low, high, xtol=1e-9))
+        except (ValueError, RuntimeError):
+            results.extend([(float("nan"), False)] * (len(targets) - len(results)))
+            break
+        results.append((direction * strength, True))
+        low = strength
+    return results
 
 
 # ---------------------------------------------------------------------------

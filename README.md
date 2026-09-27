@@ -343,10 +343,13 @@ corresponding code cells:
   for every dataset), with ROC-AUC as the primary metric:
   - **re-weighted test populations** (every row keeps its own (x, y), so
     P(y | x) is unchanged): population shifts along the leading principal
-    components and towards typical / atypical rows, and **dependence shifts**
-    that make pairs of correlated inputs less or more dependent while each
-    input keeps its location and spread. Severity = the effective sample size
-    left on the training rows (90% to 60%);
+    components and towards typical / atypical rows (severity = the effective
+    sample size left on the training rows, 90% to 60%), and **dependence
+    shifts** that weaken pairs of correlated inputs (25% to 100% of the
+    correlation removed, never beyond zero) or strengthen them (+12.5% to +50%)
+    while each input keeps its location and spread. Every family is summarised
+    over one cohort — the scenarios usable at every level — so the report, the
+    tests and the figures describe the same scenarios;
   - **corrupted test sets** from a fixed bank shared by all models (common
     random numbers, independent of the GA seed): measurement noise, recording
     noise of 0/1 inputs (one-hot groups re-drawn as one input),
