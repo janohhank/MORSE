@@ -97,6 +97,8 @@ seed varies — this is a deliberate design choice.
 ├── robustness_config.py             # Robustness-suite settings (the same for every dataset)
 ├── robustness_utils.py              # Automatic feature schema, re-weightings, corruption bank
 ├── robustness_evaluation.py         # Robustness suite: notebook entry point + stand-alone CLI
+├── legacy_stress_evaluation.py      # Legacy stress grid (noise x PC1 shift, 0/1 re-draw, AURS):
+│                                    #   optional notebook block + stand-alone CLI
 ├── docs/robustness.md               # The robustness suite in detail
 ├── checkpoint_utils.py              # Per-seed training checkpoints (Pareto fronts, masks)
 │                                    #   and resuming a run
@@ -134,11 +136,12 @@ data through its official access pathway and add a matching config block.
 | `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector`. |
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
 | `training_utils` | `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
-| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
-| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), and `find_balanced_threshold`. The stress tests of runs made before the robustness suite (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) are kept only so that those results can be reproduced. |
+| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
+| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), and `find_balanced_threshold`. The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
 | `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
 | `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with availability flags, forbidden 0/1 combinations — from the training rows), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
-| `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
+| `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
+| `legacy_stress_evaluation` | `run_legacy_stress_grid`: the robustness evaluation of runs made before the suite (Gaussian noise × PC1 covariate-shift grid, 0/1 re-draw noise, AURS), unchanged — it reproduces those runs' CSVs byte for byte — as an optional notebook block and as `python legacy_stress_evaluation.py --run <result folder>`. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
 | `deap_types` | The DEAP fitness / individual classes (`FitnessMulti` / `Individual`, `FitnessSingle` / `IndividualSingle`), defined once for the trainers, the notebook and the checkpoint loader. |
 
@@ -200,6 +203,7 @@ YYYY-MM-DD_HH-MM-SS/
 ├── checkpoints/training/                 # fingerprint.json + seed_<N>/ (morse_front.csv, selections.json, complete.json)
 └── evaluation/
     ├── robustness/                       # robustness suite: report, CSV tables, tests, five figures
+    ├── all_models_comparison/            # legacy stress grid (optional block): per-seed CSVs, AURS, four figures
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
     ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
     └── best_morse_model/                 # best-seed metrics CSV + sensitivity/specificity curve PDF
@@ -256,11 +260,22 @@ python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
 ```
 
 The run's data are rebuilt from the configuration and data-loading cells of the
-notebook copy archived in the run folder, checked against the run's checkpoint
-fingerprint, and the final models are refit from the saved masks. The outputs
-go to `<run>/evaluation/robustness/` (`--out` for another folder; `--selection`
-and `--seeds` are described by `--help`). See
-[docs/robustness.md](docs/robustness.md).
+notebook copy archived in the run folder (or of the copy given with
+`--notebook`), checked against the run's checkpoint fingerprint, and the final
+models are refit from the saved masks. The outputs go to
+`<run>/evaluation/robustness/`; an evaluation with a Pareto rule other than the
+run's own (`--selection knee` / `max_s`) goes to `robustness_<rule>/`, so it
+never overwrites the run's (`--out` for another folder; `--seeds` is described
+by `--help`). See [docs/robustness.md](docs/robustness.md).
+
+The legacy stress grid works the same way:
+
+```bash
+python legacy_stress_evaluation.py --run 2026-09-25_16-05-04_radfusion_pr
+```
+
+writes `<run>/evaluation/all_models_comparison/` (`..._<rule>` / `..._roc` /
+`..._pr` when the rule or the metric differs from the run's own).
 
 ### Numerical reproducibility
 
@@ -343,9 +358,15 @@ corresponding code cells:
     over the seeds), an exploratory sign-consistency-vs-degradation analysis,
     five figures and `report.txt`.
 
-  The suite replaces the Gaussian-noise × PC1 covariate-shift grid and its
-  AURS score of earlier runs; those functions remain in `evaluation_utils.py`
-  only for reproducing such runs.
+- **Legacy stress grid** (`evaluation/all_models_comparison/`, optional block
+  after the suite, `RUN_LEGACY_STRESS_GRID`) — the robustness evaluation of runs
+  made before the suite, unchanged so that results stay comparable with them:
+  Gaussian noise × a covariate shift along the first principal component (a
+  re-weighting of the test rows, both directions), re-draw noise on the 0/1
+  inputs, and AURS (the fraction of each method's own clean score kept over the
+  grid). Its limits are the reasons for the suite: availability flags are
+  re-drawn like any 0/1 input, and AURS nets gains in one shift direction
+  against losses in the other.
 - **Feature-count comparison** — a boxplot + stripplot of the number of
   selected features per method across seeds, with per-seed and summary CSVs,
   showing the parsimony of each method.

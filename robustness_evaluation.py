@@ -26,9 +26,10 @@ Two ways to run it
   * later, on any checkpointed run, without retraining:
         python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
     The run's data are rebuilt by executing the configuration and data-loading cells of the notebook
-    copy archived in the run folder, and checked against the run's checkpoint fingerprint.
+    copy archived in the run folder (or of a copy given with --notebook), and checked against the run's
+    checkpoint fingerprint.
 
-Outputs (default: <run>/evaluation/robustness/)
+Outputs (default: <run>/evaluation/robustness/; robustness_<rule>/ for a Pareto rule other than the run's)
   config.json                 the suite settings and the provenance of the evaluation
   schema.json                 the inferred feature schema
   models.csv                  every final model: size, sign consistency, clean ROC-AUC / PR-AUC
@@ -837,16 +838,18 @@ def _provenance(config: RobustnessConfig, run_directory: str | None, X_train: pa
 # Stand-alone use on a finished run
 # ---------------------------------------------------------------------------
 
-def load_archived_run(run_directory: str) -> dict[str, Any]:
+def load_archived_run(run_directory: str, notebook: str | None = None) -> dict[str, Any]:
     """Rebuild a run's training and test data by executing the configuration and data-loading cells of
-    the copy of training_notebook.ipynb archived in the run folder: every code cell from the first one
-    that assigns TARGET_COLUMN to the first one that assigns X_test. This reproduces the exact inputs
-    of the run (paths, merged validation file, column whitelist) without restating them. The result is
-    checked against the run's checkpoint fingerprint by `verify_training_data`."""
-    path: str = os.path.join(run_directory, "training_notebook.ipynb")
+    the copy of training_notebook.ipynb archived in the run folder (or of the copy `notebook`): every
+    code cell from the first one that assigns TARGET_COLUMN to the first one that assigns X_test. This
+    reproduces the exact inputs of the run (paths, merged validation file, column whitelist) without
+    restating them. The result is checked against the run's checkpoint fingerprint by
+    `verify_training_data`."""
+    path: str = notebook or os.path.join(run_directory, "training_notebook.ipynb")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"{path} does not exist: the run folder has no archived copy of the notebook, "
-                                f"so its data cannot be rebuilt")
+                                f"so its data cannot be rebuilt (pass a copy of the notebook that has the run's "
+                                f"data settings with --notebook)")
     sources: list[str] = ["".join(cell.get("source", [])) for cell in read_json(path).get("cells", [])
                           if cell.get("cell_type") == "code"]
     start: int | None = next((i for i, source in enumerate(sources)
@@ -898,6 +901,57 @@ def verify_training_data(run_directory: str, X_train: pandas.DataFrame, y_train:
     return fingerprint
 
 
+@dataclass
+class RunModels:
+    """A finished run, rebuilt without retraining: its data and the final model of every method and seed."""
+    directory: str
+    X_train: pandas.DataFrame
+    y_train: pandas.Series
+    X_test: pandas.DataFrame
+    y_test: pandas.Series
+    packages: dict[int, dict[str, dict]]
+    seeds: list[int]
+    use_knee_point: bool        # MORSE's Pareto rule used here ...
+    own_rule: str               # ... and the run's own rule ("knee" / "max_s")
+    use_roc_auc: bool           # the run's main objective
+    fingerprint: dict[str, Any]
+
+    @property
+    def rule(self) -> str:
+        return "knee" if self.use_knee_point else "max_s"
+
+    @property
+    def folder_suffix(self) -> str:
+        """"" for the run's own rule, "_knee" / "_max_s" otherwise: an evaluation with another rule gets
+        its own output folder instead of overwriting the run's."""
+        return "" if self.rule == self.own_rule else f"_{self.rule}"
+
+
+def load_run_models(run: str, selection: str = "auto", seeds: Sequence[int] | None = None,
+                    notebook: str | None = None, say: Callable[[str], None] = print) -> RunModels:
+    """Rebuild a checkpointed run: its data (checked against the checkpoint fingerprint) and the final
+    models of `seeds` (default: every seed with a complete checkpoint). `selection` picks MORSE's Pareto
+    solution: "auto" = the run's own rule, or "knee" / "max_s"."""
+    directory: str = os.path.normpath(run if os.path.isabs(run) else os.path.join(repository_root(), run))
+    data: dict[str, Any] = load_archived_run(directory, notebook)
+    fingerprint: dict[str, Any] = verify_training_data(directory, data["X_train"], data["y_train"])
+    store: TrainingCheckpointStore = TrainingCheckpointStore(os.path.join(directory, "checkpoints", "training"),
+                                                             fingerprint)
+    chosen: list[int] = sorted(seeds) if seeds else store.completed_seeds()
+    fronts, single, forward, everything = store.load_all(chosen)
+    use_knee_point: bool = data["use_knee_point"] if selection == "auto" else selection == "knee"
+    say(f"Run {directory}: {len(chosen)} seeds; MORSE = the {'knee point' if use_knee_point else 'max-S end'} "
+        f"of every Pareto front.")
+    packages: dict[int, dict[str, dict]] = build_final_models(
+        list(data["X_train"].columns), data["X_train"], data["y_train"], chosen, fronts, single, forward,
+        everything, use_knee_point)
+    return RunModels(directory=directory, X_train=data["X_train"], y_train=data["y_train"], X_test=data["X_test"],
+                     y_test=data["y_test"], packages=packages, seeds=chosen, use_knee_point=use_knee_point,
+                     own_rule="knee" if data["use_knee_point"] else "max_s",
+                     use_roc_auc=bool(fingerprint.get("settings", {}).get("training_config", {}).get("use_roc_auc", True)),
+                     fingerprint=fingerprint)
+
+
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the robustness suite on the final models of a checkpointed run (no retraining).")
@@ -907,28 +961,22 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         help="which Pareto solution is MORSE's final model; auto = the run's own rule")
     parser.add_argument("--seeds", type=int, nargs="*", default=None,
                         help="evaluate only these seeds (default: every seed with a complete checkpoint)")
-    parser.add_argument("--out", default=None, help="output folder (default: <run>/evaluation/robustness)")
+    parser.add_argument("--notebook", default=None,
+                        help="a copy of training_notebook.ipynb to rebuild the data from, for a run folder without "
+                             "an archived copy of the notebook (checked against the checkpoints)")
+    parser.add_argument("--out", default=None,
+                        help="output folder (default: <run>/evaluation/robustness, or robustness_<rule> for a "
+                             "rule other than the run's own)")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     arguments: argparse.Namespace = parse_arguments(argv)
-    run: str = arguments.run if os.path.isabs(arguments.run) else os.path.join(repository_root(), arguments.run)
-    run = os.path.normpath(run)
-    data: dict[str, Any] = load_archived_run(run)
-    fingerprint: dict[str, Any] = verify_training_data(run, data["X_train"], data["y_train"])
-    store: TrainingCheckpointStore = TrainingCheckpointStore(os.path.join(run, "checkpoints", "training"), fingerprint)
-    seeds: list[int] = sorted(arguments.seeds) if arguments.seeds else store.completed_seeds()
-    fronts, single, forward, everything = store.load_all(seeds)
-    use_knee_point: bool = data["use_knee_point"] if arguments.selection == "auto" else arguments.selection == "knee"
-    print(f"Run {run}: {len(seeds)} seeds; MORSE = the {'knee point' if use_knee_point else 'max-S end'} "
-          f"of every Pareto front.")
-    packages: dict[int, dict[str, dict]] = build_final_models(
-        list(data["X_train"].columns), data["X_train"], data["y_train"], seeds, fronts, single, forward,
-        everything, use_knee_point)
-    run_robustness_suite(data["X_train"], data["y_train"], data["X_test"], data["y_test"], packages,
-                         output_directory=arguments.out or os.path.join(run, "evaluation", "robustness"),
-                         run_directory=run)
+    run: RunModels = load_run_models(arguments.run, arguments.selection, arguments.seeds, arguments.notebook)
+    run_robustness_suite(run.X_train, run.y_train, run.X_test, run.y_test, run.packages,
+                         output_directory=arguments.out or os.path.join(run.directory, "evaluation",
+                                                                        "robustness" + run.folder_suffix),
+                         run_directory=run.directory)
 
 
 if __name__ == "__main__":

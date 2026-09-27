@@ -1,6 +1,6 @@
 """Tests of evaluation_utils: column-type detection, the final model package and its scores, the sign
 consistency of a final model, the balanced sensitivity / specificity threshold, and the stress tests of
-runs made before the robustness suite (Gaussian noise, PC1 covariate shift) that are kept to reproduce them.
+the legacy stress grid (Gaussian noise, PC1 covariate shift, AURS).
 (compute_marginal_correlations and apply_dummy_noise have their own test files.)
 
 Run from the repository root:
@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation_utils import (apply_dummy_noise, apply_proportional_noise, build_model_package,  # noqa: E402
-                              compute_marginal_correlations, compute_model_sign_consistency,
+                              compute_aurs, compute_marginal_correlations, compute_model_sign_consistency,
                               covariate_shift_weights, evaluate_model, find_balanced_threshold,
                               fit_covariate_shift_axis, get_continuous_columns, get_dummy_columns,
                               predict_scores, score_predictions)
@@ -166,6 +166,34 @@ class LegacyStressTests(unittest.TestCase):
         clipped = weights[negatives][score[negatives] >= 2.0]
         if clipped.size > 1:
             self.assertAlmostEqual(clipped.min(), clipped.max(), places=12)
+
+
+class AursTests(unittest.TestCase):
+    @staticmethod
+    def surface(function, noise=numpy.linspace(0.0, 1.0, 11), shift=numpy.linspace(-1.0, 1.0, 11)) -> pandas.DataFrame:
+        rows = [{"noise_level": n, "mean_shift": s, "auc_m": function(n, s)} for n in noise for s in shift]
+        return pandas.DataFrame(rows).groupby(["noise_level", "mean_shift"]).mean()
+
+    def test_a_flat_surface_keeps_everything(self):
+        self.assertAlmostEqual(compute_aurs(self.surface(lambda n, s: 0.8), "m"), 1.0, places=12)
+
+    def test_a_linear_loss_is_integrated_exactly(self):
+        # retention 1 - 0.2 * noise: the mean over noise in [0, 1] is 0.9, whatever the shift
+        self.assertAlmostEqual(compute_aurs(self.surface(lambda n, s: 0.8 * (1 - 0.2 * n)), "m"), 0.9, places=12)
+        # a gain on one side of the shift cancels a loss on the other: the limitation the docstring names
+        self.assertAlmostEqual(compute_aurs(self.surface(lambda n, s: 0.8 * (1 + 0.1 * s)), "m"), 1.0, places=12)
+
+    def test_uneven_levels_are_weighted_by_their_spacing(self):
+        noise = numpy.array([0.0, 0.1, 1.0])
+        # retention 1 on [0, 0.1], then falls linearly to 0.5 at 1.0: area 0.1 + 0.9 * 0.75 = 0.775
+        value = compute_aurs(self.surface(lambda n, s: 0.8 if n <= 0.1 else 0.4, noise=noise), "m")
+        self.assertAlmostEqual(value, 0.775, places=12)
+
+    def test_the_clean_cell_is_required(self):
+        with self.assertRaisesRegex(ValueError, "clean cell"):
+            compute_aurs(self.surface(lambda n, s: 0.8, noise=numpy.array([0.1, 0.5])), "m")
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            compute_aurs(self.surface(lambda n, s: 0.0), "m")
 
 
 if __name__ == "__main__":

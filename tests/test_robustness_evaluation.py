@@ -315,6 +315,25 @@ class CommandLineTests(unittest.TestCase):
         self.run_main("--seeds", "1")
         self.assertTrue(os.path.isfile(os.path.join(self.run_directory, "evaluation", "robustness", "report.txt")))
 
+    def test_another_rule_gets_its_own_default_folder(self):
+        self.run_main("--seeds", "1", "--selection", "knee")
+        self.assertTrue(os.path.isfile(os.path.join(self.run_directory, "evaluation", "robustness_knee", "report.txt")))
+
+    def test_a_notebook_copy_can_stand_in_for_a_missing_archived_one(self):
+        other = os.path.join(self.temporary.name, "run_without_notebook")
+        os.makedirs(other)
+        write_run_folder(other)
+        copy = os.path.join(self.temporary.name, "notebook_copy.ipynb")
+        os.replace(os.path.join(other, "training_notebook.ipynb"), copy)
+        with self.assertRaisesRegex(FileNotFoundError, "--notebook"):
+            evaluation.load_run_models(other, say=lambda line: None)
+        run = evaluation.load_run_models(other, "max_s", [2], notebook=copy, say=lambda line: None)
+        self.assertEqual((run.rule, run.own_rule, run.folder_suffix, run.seeds, run.use_roc_auc),
+                         ("max_s", "max_s", "", [2], True))
+        self.assertEqual(run.packages[2]["multi"]["features"], self.info["features"][:6])     # max-S end: 4 + seed
+        knee = evaluation.load_run_models(other, "knee", [2], notebook=copy, say=lambda line: None)
+        self.assertEqual((knee.rule, knee.folder_suffix), ("knee", "_knee"))
+
     def test_other_data_are_refused(self):
         other = os.path.join(self.temporary.name, "other_run")
         os.makedirs(other)

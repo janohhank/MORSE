@@ -503,6 +503,122 @@ def plot_sign_vs_degradation(points: pandas.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Legacy stress grid (legacy_stress_evaluation.py): noise x covariate shift, binary re-draw noise
+# ---------------------------------------------------------------------------
+
+def plot_noise_comparison(agg_df: pandas.DataFrame,
+                          model_styles: dict[str, tuple[str, str, str, str]],
+                          xlabel: str,
+                          ylabel: str,
+                          title: str,
+                          out_path: str) -> None:
+    """Line plot of mean AUC vs. a 1D noise level for multiple models with
+    shaded +/- 1 std bands.
+
+    Parameters
+    ----------
+    agg_df
+        Multi-index-column DataFrame produced by
+        `.groupby(level_col).agg(["mean", "std"])`. Expected to have
+        `(f"auc_{key}", "mean")` and `(f"auc_{key}", "std")` columns for
+        every `key` in `model_styles`.
+    model_styles
+        Dict mapping model key -> (display name, colour, marker, linestyle).
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for key, (name, colour, marker, ls) in model_styles.items():
+        mean_series: pandas.Series = agg_df[(f"auc_{key}", "mean")]
+        std_series:  pandas.Series = agg_df[(f"auc_{key}", "std")].fillna(0.0)
+        x_vals: numpy.ndarray = mean_series.index.values
+        m_vals: numpy.ndarray = mean_series.values
+        s_vals: numpy.ndarray = std_series.values
+        ax.plot(x_vals, m_vals, label=name,
+                color=colour, marker=marker, linestyle=ls, linewidth=2)
+        ax.fill_between(x_vals, m_vals - s_vals, m_vals + s_vals,
+                        color=colour, alpha=0.15)
+    ax.set_xlabel(xlabel, fontweight="bold")
+    ax.set_ylabel(ylabel, fontweight="bold")
+    ax.set_title(title, fontweight="bold", pad=10)
+    ax.legend(frameon=True, fancybox=True, shadow=True)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_2d_heatmap_grid(heatmap_agg: pandas.DataFrame,
+                         model_styles: dict[str, tuple[str, str, str, str]],
+                         cbar_label: str,
+                         xlabel: str,
+                         ylabel: str,
+                         title: str,
+                         out_path: str,
+                         aurs_scores: dict[str, float] | None = None) -> None:
+    """Render a 2x2 grid of heatmaps -- one panel per model -- sharing the
+    same vmin/vmax so the panels are directly visually comparable.
+
+    Parameters
+    ----------
+    heatmap_agg
+        A pandas DataFrame with a two-level MultiIndex whose LEVELS are
+        (noise_level, mean_shift) and whose columns include one
+        `auc_{key}` for every `key` in `model_styles`.
+    model_styles
+        Same shape as in `plot_noise_comparison`; only the display name
+        (index 0) is used for the panel title -- colour/marker/linestyle
+        are irrelevant for the heatmap and get ignored.
+    aurs_scores
+        Optional dict mapping each `model_styles` key to its AURS score
+        (see `evaluation_utils.compute_aurs`) -- the fraction of that
+        model's own clean-test score retained on average across this whole
+        grid. When given, each panel's title gets a second line showing it
+        as a percentage. `None` (the default) omits the subtitle.
+    """
+    ensure_directory(os.path.dirname(out_path))
+    _apply_plot_theme()
+
+    def _pivot(model_key: str) -> pandas.DataFrame:
+        col_name: str = f"auc_{model_key}"
+        m: pandas.DataFrame = heatmap_agg[[col_name]].reset_index()
+        pivot: pandas.DataFrame = m.pivot(
+            index="mean_shift", columns="noise_level", values=col_name)
+        # Order rows so the most-positive shift is on top.
+        return pivot.sort_index(ascending=False)
+
+    pivots: dict[str, pandas.DataFrame] = {
+        key: _pivot(key) for key in model_styles.keys()
+    }
+    shared_vmin: float = min(float(p.values.min()) for p in pivots.values())
+    shared_vmax: float = max(float(p.values.max()) for p in pivots.values())
+
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    for ax, (key, pivot) in zip(axes.flat, pivots.items()):
+        display_name: str = model_styles[key][0]
+        sns.heatmap(
+            pivot,
+            ax=ax,
+            cmap="viridis",
+            vmin=shared_vmin, vmax=shared_vmax,
+            cbar_kws={"label": cbar_label},
+            annot=False,
+            square=False,
+        )
+        panel_title: str = display_name
+        if aurs_scores is not None:
+            panel_title += f"\nAURS = {aurs_scores[key]:.1%}"
+        ax.set_title(panel_title, fontweight="bold", pad=8)
+        ax.set_xlabel(xlabel, fontweight="bold")
+        ax.set_ylabel(ylabel, fontweight="bold")
+
+    fig.suptitle(title, fontweight="bold", fontsize=13, y=1.00)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Balanced sensitivity / specificity curve for the deployed model
 # ---------------------------------------------------------------------------
 

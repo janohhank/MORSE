@@ -29,8 +29,10 @@ picked after seeing which one favours a method.
   first one that assigns `X_test`. This reproduces the run's paths, the merged validation file and any
   column whitelist. The rebuilt training data are then checked against the run's checkpoint fingerprint
   (feature names, hashes of the standardised training matrix and of the labels). The models are refit
-  from the checkpointed masks.
-  Options: `--selection auto|knee|max_s` picks MORSE's Pareto solution (`auto` uses the run's own rule),
+  from the checkpointed masks. A run folder without an archived notebook can use a copy given with
+  `--notebook` (the fingerprint check still applies).
+  Options: `--selection auto|knee|max_s` picks MORSE's Pareto solution (`auto` uses the run's own rule;
+  another rule writes to `robustness_<rule>/`, so it never overwrites the run's own evaluation),
   `--seeds 42 43 ...` evaluates a subset of seeds, and `--out` sets another output folder.
   A run takes about 0.5–1 minute per dataset.
 
@@ -254,5 +256,9 @@ every seed, that band was pure corruption noise. The bank separates the two.
   changes no computation, but a noisy count can be negative.
 * Under-recording applies to every stand-alone 0/1 input with a prevalence below 50%. The rule cannot
   tell a record (a diagnosis code) from an attribute (an institution type).
-* The stress tests of runs made before the suite (Gaussian noise × PC1 grid, AURS) remain in
-  `evaluation_utils.py` only so that those results can be reproduced.
+* The robustness evaluation of runs made before the suite — the Gaussian noise × PC1 covariate-shift
+  grid, 0/1 re-draw noise and AURS — is kept unchanged as the **legacy stress grid**
+  (`legacy_stress_evaluation.py`): an optional notebook block after the suite and
+  `python legacy_stress_evaluation.py --run <run>`, writing `evaluation/all_models_comparison/` as before.
+  It reproduces the stored CSVs of earlier runs byte for byte. Its limits are the reasons for the suite:
+  it re-draws availability flags like any 0/1 input, and AURS averages the two shift directions.

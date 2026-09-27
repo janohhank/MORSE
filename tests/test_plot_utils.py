@@ -22,8 +22,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from deap import creator  # noqa: E402
 
 from deap_types import ensure_multi_objective_types  # noqa: E402
-from plot_utils import (_panel_grid, plot_corruption_curves, plot_dependence_shift_summary,  # noqa: E402
-                        plot_feature_count_comparison, plot_multi_objective_convergence, plot_pareto_front,
+from plot_utils import (_panel_grid, plot_2d_heatmap_grid, plot_corruption_curves,  # noqa: E402
+                        plot_dependence_shift_summary, plot_feature_count_comparison,
+                        plot_multi_objective_convergence, plot_noise_comparison, plot_pareto_front,
                         plot_population_shift_curves, plot_robustness_overview, plot_sign_consistency_comparison,
                         plot_sign_vs_degradation, plot_single_objective_convergence,
                         plot_specificity_sensitivity_curve)
@@ -181,6 +182,32 @@ class RobustnessFigureTests(PlotTestCase):
         self.assertEqual(axes.shape, (2, 4))
         self.assertEqual([ax.get_visible() for ax in axes.flat], [True] * 5 + [False] * 3)
         plt.close(fig)
+
+
+class LegacyGridFigureTests(PlotTestCase):
+    def grid(self) -> pandas.DataFrame:
+        rows = [{"seed": seed, "noise_level": n, "mean_shift": s,
+                 **{f"auc_{key}": 0.8 - 0.1 * n + 0.02 * s + 0.01 * seed for key in STYLES}}
+                for seed in (1, 2) for n in (0.0, 0.5, 1.0) for s in (-1.0, 0.0, 1.0)]
+        return pandas.DataFrame(rows)
+
+    def test_noise_comparison_with_and_without_spread(self):
+        grid = self.grid()
+        agg = grid[grid["mean_shift"] == 0.0].drop(columns=["seed", "mean_shift"]).groupby("noise_level").agg(["mean", "std"])
+        plot_noise_comparison(agg, STYLES, "noise", "AUC", "t", self.path("noise.png"))
+        self.assertImage(self.path("noise.png"))
+        one_seed = grid[(grid["seed"] == 1) & (grid["mean_shift"] == 0.0)].drop(columns=["seed", "mean_shift"])
+        plot_noise_comparison(one_seed.groupby("noise_level").agg(["mean", "std"]), STYLES, "noise", "AUC", "t",
+                              self.path("noise1.png"))           # std is NaN with one seed: no band
+        self.assertImage(self.path("noise1.png"))
+
+    def test_heatmap_grid_with_and_without_aurs(self):
+        agg = self.grid().drop(columns=["seed"]).groupby(["noise_level", "mean_shift"]).mean()
+        plot_2d_heatmap_grid(agg, STYLES, "AUC", "noise", "shift", "t", self.path("heat.png"),
+                             aurs_scores={key: 0.95 for key in STYLES})
+        self.assertImage(self.path("heat.png"))
+        plot_2d_heatmap_grid(agg, STYLES, "AUC", "noise", "shift", "t", self.path("heat0.png"))
+        self.assertImage(self.path("heat0.png"))
 
 
 if __name__ == "__main__":
