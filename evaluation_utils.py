@@ -9,11 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
-# numpy 2.0 renamed `trapz` to `trapezoid` and later fully removed `trapz`
-# (accessing it raises AttributeError instead of merely warning); numpy < 2.0
-# only has `trapz`. Resolve once here so `compute_aurs` works unmodified on
-# either numpy major version, regardless of exactly what's installed.
-_trapezoid = getattr(numpy, "trapezoid", None) or numpy.trapz
+from training_utils import select_pareto_individual
 
 # ---------------------------------------------------------------------------
 # Sign consistency score calculation
@@ -138,7 +134,12 @@ def get_dummy_columns(df: pandas.DataFrame) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Noise injection
+# Noise injection and covariate shift -- LEGACY
+#
+# The pipeline evaluates robustness with the robustness suite (robustness_evaluation.py,
+# robustness_utils.py; docs/robustness.md). The stress tests below are the ones runs made before the
+# suite used. They drive the legacy stress grid (legacy_stress_evaluation.py), which the notebook still
+# runs as an optional block, so that results stay comparable with earlier runs.
 # ---------------------------------------------------------------------------
 
 def apply_proportional_noise(
@@ -185,7 +186,7 @@ def apply_dummy_noise(
         dummy_cols: list[str],
         train_prevalence: pandas.Series | None = None) -> pandas.DataFrame:
     """
-    Prevalence-preserving randomisation noise on dummy (binary) variables.
+    Re-draw noise on dummy (binary) variables, from each column's training prevalence.
 
     Every dummy cell is, independently, **re-drawn with probability
     `noise_fraction`** from a Bernoulli distribution with the column's own
@@ -194,9 +195,9 @@ def apply_dummy_noise(
 
     * 0.0  -> original data, no noise
     * 0.5  -> half of the cells are re-drawn from their column's marginal
-    * 1.0  -> every column is independent of the truth but keeps its prevalence
-              (no information left, monotonic all the way -- fractions above
-              0.5 cannot invert the signal)
+    * 1.0  -> every column is independent of the truth and follows its training
+              prevalence (no information left; the information falls monotonically
+              with the fraction -- fractions above 0.5 cannot invert the signal)
 
     WHY NOT A FAIR COIN (the earlier implementation re-drew with P(1) = 0.5)
     A fair coin is far from the marginal of a rare flag, so it does not add
@@ -225,11 +226,14 @@ def apply_dummy_noise(
       * a recorded 1 is right with probability 1 - p*(1 - pi), i.e. about
         1 - p for rare flags, and false positives affect only about p*pi of
         the patients (0.4% instead of 4.8% in the example above);
-      * degradation is monotone in p and needs no cap for very dense columns
-        (a scheme that keeps sensitivity = precision = 1 - p by flipping 0 -> 1
-        with probability p*pi/(1 - pi) would exceed probability 1 for every
-        column with pi > 1/(1 + p), e.g. the seven RadFusion lab flags with
-        91-94% prevalence at p = 0.1).
+      * the information a column keeps falls monotonically in p (its correlation
+        with the clean column is 1 - p), and the scheme needs no cap for very
+        dense columns (a scheme that keeps sensitivity = precision = 1 - p by
+        flipping 0 -> 1 with probability p*pi/(1 - pi) would exceed probability 1
+        for every column with pi > 1/(1 + p), e.g. the seven RadFusion lab flags
+        with 91-94% prevalence at p = 0.1). A frozen model's measured score on
+        one finite test set need not fall monotonically in every realisation,
+        though.
 
     LIMITATION: every column is re-drawn independently, so the noise breaks
     the association BETWEEN columns for the re-drawn cells (a real recording
@@ -278,7 +282,7 @@ def apply_dummy_noise(
 
 
 # ---------------------------------------------------------------------------
-# Covariate shift (re-weighted test population)
+# Covariate shift (re-weighted test population) -- LEGACY, see above
 # ---------------------------------------------------------------------------
 
 def fit_covariate_shift_axis(X_train: pandas.DataFrame) -> dict[str, Any]:
@@ -521,8 +525,77 @@ def find_balanced_threshold(
 
 
 # ---------------------------------------------------------------------------
-# AURS: Area Under the Robustness Surface
+# The single deployment model, chosen without the test set
 # ---------------------------------------------------------------------------
+
+def out_of_fold_scores(
+        package: dict[str, Any],
+        X_train: pandas.DataFrame,
+        y_train: Union[numpy.ndarray, pandas.Series],
+        cv: Any,
+        seed: int) -> numpy.ndarray:
+    """Out-of-fold predicted probabilities of a model package's specification on the training data: for
+    every fold of `cv`, a fresh StandardScaler and the same logistic regression as `build_model_package`
+    are fit on the other folds and predict the held-out rows."""
+    features: list[str] = package["features"]
+    X: numpy.ndarray = X_train[features].to_numpy(dtype=float)
+    y: numpy.ndarray = numpy.asarray(y_train).astype(int)
+    scores: numpy.ndarray = numpy.zeros(len(y))
+    for train_rows, held_out in cv.split(X, y):
+        scaler: StandardScaler = StandardScaler().fit(X[train_rows])
+        model: LogisticRegression = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=seed)
+        model.fit(scaler.transform(X[train_rows]), y[train_rows])
+        scores[held_out] = model.predict_proba(scaler.transform(X[held_out]))[:, 1]
+    return scores
+
+
+def select_deployment_model(
+        pareto_fronts: dict[int, list],
+        seeds: list[int],
+        feature_names: list[str],
+        X_train: pandas.DataFrame,
+        y_train: Union[numpy.ndarray, pandas.Series],
+        cv: Any,
+        use_knee_point: bool) -> dict[str, Any]:
+    """The single MORSE model to deploy, chosen WITHOUT the test set.
+
+    * Seed: the one whose selected Pareto solution (knee point or max-S end, like everywhere else) has the
+      best cross-validated main objective -- the GA's own first fitness value, computed on the same
+      folds for every seed; a tie goes to the smallest seed. Choosing the seed by its TEST score instead
+      picks the luckiest of the seeds on that test set, so the reported test score is optimistic.
+    * Threshold: the one at which sensitivity and specificity are closest on OUT-OF-FOLD predictions of
+      the training data (`out_of_fold_scores`, the same CV splitter). A threshold found on the test labels
+      is fitted to the very rows it is then evaluated on.
+    The test set is then used once, to evaluate the chosen model at the chosen threshold.
+
+    Returns {"seed", "individual", "cv_objective", "package" (refit on the whole training set),
+    "oof_scores", "threshold", "balanced" (find_balanced_threshold on the out-of-fold predictions)}.
+    """
+    candidates: list[tuple[float, int, Any]] = []
+    for seed in seeds:
+        individual = select_pareto_individual(pareto_fronts[seed], use_knee_point=use_knee_point)
+        candidates.append((float(individual.fitness.values[0]), seed, individual))
+    cv_objective, seed, individual = max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))
+    package: dict[str, Any] = build_model_package(individual, feature_names, X_train, y_train, seed=seed)
+    oof: numpy.ndarray = out_of_fold_scores(package, X_train, y_train, cv, seed)
+    balanced: dict[str, Any] = find_balanced_threshold(y_train, oof)
+    return {"seed": seed, "individual": individual, "cv_objective": cv_objective, "package": package,
+            "oof_scores": oof, "threshold": balanced["threshold"], "balanced": balanced}
+
+
+# ---------------------------------------------------------------------------
+# AURS: Area Under the Robustness Surface -- LEGACY
+#
+# The summary of the legacy stress grid (legacy_stress_evaluation.py). The robustness suite
+# (robustness_evaluation.py) does not use it.
+# ---------------------------------------------------------------------------
+
+# numpy 2.0 renamed `trapz` to `trapezoid` and later fully removed `trapz`
+# (accessing it raises AttributeError instead of merely warning); numpy < 2.0
+# only has `trapz`. Resolve once here so `compute_aurs` works unmodified on
+# either numpy major version, regardless of exactly what's installed.
+_trapezoid = getattr(numpy, "trapezoid", None) or numpy.trapz
+
 
 def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
     """Summarise a model's noise-robustness 2-D sweep into a single score:
@@ -531,15 +604,15 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
     WHAT AURS IS
     ------------
     The 2-D noise sweep (`gaussian_2d_heatmap_grid_test.png` / `heatmap_agg`
-    in the notebook) evaluates every model at each combination of
-    (Gaussian noise level, covariate-shift strength), giving one AUC/PR-AUC
-    number per grid cell. The second axis is stored in the column named
-    `mean_shift`; it holds the strength of the re-weighted-population covariate
-    shift of `covariate_shift_weights` (in SD of the dominant covariate axis),
-    not a translation of feature values. AURS collapses that whole grid into
-    ONE number per model: the average fraction of the model's OWN clean-test
-    score that it retains, averaged over every stress condition in the swept
-    grid.
+    of `legacy_stress_evaluation.run_legacy_stress_grid`) evaluates every model
+    at each combination of (Gaussian noise level, covariate-shift strength),
+    giving one AUC/PR-AUC number per grid cell. The second axis is stored in
+    the column named `mean_shift`; it holds the strength of the
+    re-weighted-population covariate shift of `covariate_shift_weights` (in SD
+    of the dominant covariate axis), not a translation of feature values. AURS
+    collapses that whole grid into ONE number per model: the average fraction
+    of the model's OWN clean-test score that it retains, averaged over every
+    stress condition in the swept grid.
 
     It deliberately does *not* just average the raw AUC values across the
     grid. Two models can have different clean-test AUCs, so a plain average
@@ -547,10 +620,7 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
     is this model to begin with?" (already reported elsewhere -- e.g. the
     Pareto front, or the clean-cell entry of this same grid) and "how much
     does stress hurt it, relative to where it started?" AURS isolates the
-    second question, which is the one MORSE's own hypothesis is about: "a
-    modest cost in clean-test AUC in exchange for better robustness to
-    noise" needs the clean-cost and the robustness measured separately, and
-    AURS is the robustness half of that comparison.
+    second question.
 
     HOW IT IS CALCULATED
     ---------------------
@@ -578,19 +648,18 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
        by itself scales with the size of the grid, not just its shape. The
        result of this division IS the AURS score.
 
-    INTERPRETING THE SCORE
-    -----------------------
-    - AURS = 1.0 (100%): the model's score is completely flat across the
-      ENTIRE swept range of noise and covariate shift -- effectively
-      perfect robustness within the tested grid.
-    - AURS = 0.0 (0%): the model's score collapses to zero everywhere in
-      the grid except the clean cell itself.
-    - AURS can occasionally land slightly ABOVE 1.0. This is not a bug: a
-      small amount of injected noise can sometimes marginally *improve* a
-      held-out score (a mild regularisation-like effect), and heatmap_agg
-      is itself an across-seed mean, which carries its own sampling noise
-      -- both effects are most visible in the lightly-perturbed cells
-      right next to the clean cell.
+    INTERPRETING THE SCORE -- AND ITS LIMITS
+    -----------------------------------------
+    - AURS = 1.0 (100%): on average over the grid the model keeps its whole
+      clean-test score.
+    - AURS can land ABOVE 1.0, and that is the main limitation of the score:
+      the covariate shift re-weights the test population in BOTH directions
+      along the axis, and a shift towards easier cases raises every model's
+      score (on RadFusion, for example, all four methods score higher at
+      strength -1 than on the clean test set). The average over the grid nets
+      those gains against the losses in the harmful direction, so a model can
+      look robust although it degrades badly on one side. The robustness suite
+      reports the worst scenario of a shift axis instead.
     - AURS is only meaningful together with the specific grid it was
       computed over. Widening the swept noise/shift range will generally
       LOWER every model's AURS even if nothing about the model itself
@@ -598,19 +667,12 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
       in. Always report the swept `noise_levels` / `shift_levels` extent
       alongside the score.
 
-    This normalise-by-own-clean-baseline approach is conceptually similar
-    to the relative-degradation metrics used in the image-corruption
-    robustness literature (e.g. Hendrycks & Dietterich's benchmarks of
-    common image corruptions), which likewise score robustness against a
-    model's own clean performance rather than comparing raw corrupted
-    scores across models directly.
-
     Parameters
     ----------
     heatmap_agg
         A DataFrame with a two-level MultiIndex `(noise_level, mean_shift)`
         and at least the column `f"auc_{model_key}"`, already averaged
-        across seeds -- exactly the `heatmap_agg` built in the notebook via
+        across seeds -- exactly the `heatmap_agg` built by the legacy grid via
         `heatmap_df.groupby(["noise_level", "mean_shift"]).mean()`.
     model_key
         The model key whose column (`auc_{model_key}`) to score, e.g.
@@ -661,7 +723,7 @@ def compute_aurs(heatmap_agg: pandas.DataFrame, model_key: str) -> float:
     # Double trapezoidal integration: integrate along the noise axis for
     # every shift level, then integrate the resulting 1-D profile along the
     # shift axis. `_trapezoid` resolves to numpy.trapezoid (numpy >= 2.0) or
-    # numpy.trapz (numpy < 2.0) -- see the module-level comment above.
+    # numpy.trapz (numpy < 2.0) -- see the comment above.
     inner: numpy.ndarray = _trapezoid(retention, x=noise_levels, axis=1)
     total: float = float(_trapezoid(inner, x=shift_levels))
 

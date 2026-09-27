@@ -67,12 +67,13 @@ logistic regression is **refit on the full training set** (with a fresh
 The repository compares MORSE against three baselines: a single-objective GA
 (AUC only), forward stepwise selection via scikit-learn, and the no-selection
 all-features logistic regression. Every method is evaluated across **20
-random seeds** on both clean and progressively noised versions of a **single
-fixed test set** (Gaussian noise on continuous features; a covariate shift of
-the test population, implemented by re-weighting the test patients along the
-dominant covariate axis; prevalence-preserving noise on binary dummy features), and
-results are reported as
-**mean ± 1 standard deviation across seeds**. See
+random seeds** on a **single fixed test set**, clean and under the
+**robustness suite**: test-set stresses generated automatically from the data,
+without naming any feature (re-weighted test populations — principal-component
+and dependence shifts — and corrupted test sets — measurement noise, recording
+noise, under-recording, values not available; see
+[docs/robustness.md](docs/robustness.md)). Results are reported as
+**mean ± 1 standard deviation across seeds**, with paired tests over the seeds. See
 [Numerical reproducibility](#numerical-reproducibility) for exactly what the
 seed varies — this is a deliberate design choice.
 
@@ -90,11 +91,18 @@ seed varies — this is a deliberate design choice.
 ├── all_features_training.py         # Baseline: no selection (all-ones mask)
 ├── training_config.py               # GA hyperparameter dataclass
 ├── training_utils.py                # CSV writer + Pareto-front selection helpers
-├── plot_utils.py                    # All figures (convergence, Pareto, noise, etc.)
-├── evaluation_utils.py              # Marginal correlations, noise injection, model
-│                                    #   build/eval, balanced sens/spec threshold
+├── plot_utils.py                    # All figures (convergence, Pareto, robustness, etc.)
+├── evaluation_utils.py              # Marginal correlations, model build/eval, balanced
+│                                    #   sens/spec threshold (+ the stress tests of older runs)
+├── robustness_config.py             # Robustness-suite settings (the same for every dataset)
+├── robustness_utils.py              # Automatic feature schema, re-weightings, corruption bank
+├── robustness_evaluation.py         # Robustness suite: notebook entry point + stand-alone CLI
+├── legacy_stress_evaluation.py      # Legacy stress grid (noise x PC1 shift, 0/1 re-draw, AURS):
+│                                    #   optional notebook block + stand-alone CLI
+├── docs/robustness.md               # The robustness suite in detail
 ├── checkpoint_utils.py              # Per-seed training checkpoints (Pareto fronts, masks)
 │                                    #   and resuming a run
+├── run_manifest.py                  # run_manifest.json: what a run was trained on; rebuilding its data
 ├── deap_types.py                    # The DEAP fitness / individual classes (one definition)
 ├── requirements.txt                 # Pinned dependency set
 ├── tests/                           # Unit tests: python -m unittest discover -s tests -v
@@ -129,8 +137,13 @@ data through its official access pathway and add a matching config block.
 | `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector`. |
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
 | `training_utils` | `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
-| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the noise-robustness line plots, the 2-D noise×covariate-shift heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
-| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), continuous/dummy column detection, `apply_proportional_noise` (Gaussian measurement noise), `apply_dummy_noise` (prevalence-preserving noise on binary dummy features), `fit_covariate_shift_axis` / `covariate_shift_weights` (covariate shift by re-weighting the test population), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `compute_aurs`, and `find_balanced_threshold`. |
+| `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
+| `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `find_balanced_threshold`, and `select_deployment_model` / `out_of_fold_scores` (the best MORSE model and its threshold, chosen without the test set). The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
+| `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
+| `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
+| `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
+| `legacy_stress_evaluation` | `run_legacy_stress_grid`: the robustness evaluation of runs made before the suite (Gaussian noise × PC1 covariate-shift grid, 0/1 re-draw noise, AURS), unchanged — it reproduces those runs' CSVs byte for byte — as an optional notebook block and as `python legacy_stress_evaluation.py --run <result folder>`. |
+| `run_manifest` | `run_manifest.json`, written when a run starts (data files and hashes, input order, objective, Pareto rule, settings), and `load_run_data`, which rebuilds a finished run's data from it — or from a notebook copy for older runs — plus `verify_training_data` against the checkpoint fingerprint. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
 | `deap_types` | The DEAP fitness / individual classes (`FitnessMulti` / `Individual`, `FitnessSingle` / `IndividualSingle`), defined once for the trainers, the notebook and the checkpoint loader. |
 
@@ -155,7 +168,7 @@ This installs `numpy`, `pandas`, `scipy`, `scikit-learn`, `matplotlib`,
 imports — plus `moocore`, which `deap` depends on.
 
 A reasonably fast multi-core workstation is recommended: with `N_JOBS=-1` the
-full pipeline (20 seeds × NSGA-II + SO-GA + SFS + noise sweeps) runs in
+full pipeline (20 seeds × NSGA-II + SO-GA + SFS + the robustness suite) runs in
 roughly 30–90 minutes per dataset, depending on the feature count.
 
 ### (Optional) regenerate the preprocessed CSVs
@@ -187,14 +200,17 @@ leaks into the training data.
 
 ```
 YYYY-MM-DD_HH-MM-SS/
+├── run_manifest.json                     # data files + hashes, input order, objective, Pareto rule, settings
 ├── multi/seed_<N>/                       # convergence.csv, convergence.png, pareto_front.png
 ├── single/seed_<N>/                      # convergence.csv, convergence.png
 ├── checkpoints/training/                 # fingerprint.json + seed_<N>/ (morse_front.csv, selections.json, complete.json)
 └── evaluation/
-    ├── all_models_comparison/            # 4-model noise-robustness curves + 2-D heatmap grid + per-seed CSVs
+    ├── final_models_<rule>.json          # the fitted final models (coefficients, scalers) of the Pareto rule
+    ├── robustness/                       # robustness suite: report, CSV tables, tests, five figures
+    ├── all_models_comparison/            # legacy stress grid (optional block): per-seed CSVs, AURS, four figures
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
     ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
-    └── best_morse_model/                 # best-seed metrics CSV + sensitivity/specificity curve PDF
+    └── best_morse_model/                 # the model chosen without the test set: metrics CSV + curve PDF
 ```
 
 ### Checkpoints and resuming a run
@@ -220,8 +236,19 @@ Everything is plain CSV/JSON, written atomically: the files are readable,
 usable for the paper (fronts, masks) and independent of library versions.
 `fingerprint.json` records the training configuration, the cross-validation
 settings, the feature names and hashes of the training data. The fitted
-logistic-regression packages of the evaluation are deliberately not stored:
-they are rebuilt from the masks in seconds.
+logistic-regression models are rebuilt from the masks in seconds rather than
+pickled; their coefficients and scalers are recorded once in
+`evaluation/final_models_<rule>.json`, and every later re-evaluation must
+reproduce that record (a newer library or code that fits differently stops
+with an explanation).
+
+Before training starts, the notebook also writes **`run_manifest.json`**: the
+CSV files the training and test data were read from (with SHA-256 hashes —
+found by trying the file names of the configuration cells and keeping the list
+that reproduces the data exactly), the target and the input order, fingerprints
+of the training and test arrays, the main objective, MORSE's Pareto rule, the GA
+settings, the CV and the seeds. With it, a finished run can be evaluated again
+without a copy of the notebook. Resuming a run with other data is refused.
 
 To continue after a failure (a crash in the evaluation, an interrupted
 training, a lost kernel): restart the kernel, set
@@ -237,6 +264,40 @@ kernel is still alive: create the store exactly as in cell 9 and call
 `import_results(training_store, seeds, training_results_multi,
 training_results_single, training_results_fwd, training_results_all)` to write
 the results that are in memory to disk.
+
+### Re-running the robustness suite on a finished run
+
+The robustness suite needs only the checkpoints, so it can be run again — with
+changed settings or a newer version of the suite — without retraining:
+
+```bash
+python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
+```
+
+The run's data are rebuilt from its `run_manifest.json` (the recorded CSV
+files, which must still give the recorded arrays) — or, for runs made before
+the manifest existed, from the configuration and data-loading cells of the
+notebook copy archived in the run folder (or of the copy given with
+`--notebook`) — and checked against the run's checkpoint fingerprint; the final
+models are refit from the saved masks and checked against
+`evaluation/final_models_<rule>.json`. The outputs go to
+`<run>/evaluation/robustness/`; an evaluation with a Pareto rule other than the
+run's own (`--selection knee` / `max_s`) goes to `robustness_<rule>/`, and a
+folder holding an evaluation of other data or of another rule is never
+overwritten (`--out` for another folder; `--seeds` is described by `--help`).
+Every stage's tables are saved as soon as the stage is done, and `config.json`
+records the status, the selection rule, the data fingerprints and the hashes
+of the manifest and the checkpoint fingerprint. See
+[docs/robustness.md](docs/robustness.md).
+
+The legacy stress grid works the same way:
+
+```bash
+python legacy_stress_evaluation.py --run 2026-09-25_16-05-04_radfusion_pr
+```
+
+writes `<run>/evaluation/all_models_comparison/` (`..._<rule>` / `..._roc` /
+`..._pr` when the rule or the metric differs from the run's own).
 
 ### Numerical reproducibility
 
@@ -297,57 +358,43 @@ corresponding code cells:
 - **Per-seed Pareto front** (`pareto_front.png`) with the three canonical
   selection candidates highlighted: the knee point (cyan star), best
   sign-consistency (orange diamond), and best AUC (green triangle).
-- **All-models noise-robustness comparison** on the test set for the four
-  methods (MORSE, SO-GA, all-features, forward stepwise), reported as
-  mean ± 1 std across seeds:
-  - a 1-D **Gaussian noise** sweep on continuous features (no covariate
-    shift),
-  - a 1-D **covariate-shift** sweep at a fixed Gaussian noise level (0.3),
-  - a 1-D **binary-noise** sweep on the dummy features (a fraction *p* of
-    the cells is re-drawn from its column's training prevalence),
-  - a 2-D **noise × covariate-shift** heatmap grid (one panel per method,
-    shared colour scale), each panel subtitled with that method's **AURS**
-    (Area Under the Robustness Surface) score — the average fraction of its
-    own clean-test score it retains across the whole grid; see
-    `evaluation_utils.compute_aurs` for the full definition and
-    `evaluation/all_models_comparison/aurs_scores.csv` for the raw numbers.
-  The Gaussian-noise and covariate-shift line plots are both 1-D slices of
-  the same 2-D sweep, so no evaluations are duplicated between them and the
-  heatmap grid.
+- **Robustness suite** (`evaluation/robustness/`, see
+  [docs/robustness.md](docs/robustness.md)) — the final models of the four
+  methods for every seed on the test set, under stresses generated
+  automatically from the data (no feature is named; the settings are the same
+  for every dataset), with ROC-AUC as the primary metric:
+  - **re-weighted test populations** (every row keeps its own (x, y), so
+    P(y | x) is unchanged): population shifts along the leading principal
+    components and towards typical / atypical rows (severity = the effective
+    sample size left on the training rows, 90% to 60%), and **dependence
+    shifts** that weaken pairs of correlated inputs (25% to 100% of the
+    correlation removed, never beyond zero) or strengthen them (+12.5% to +50%)
+    while each input keeps its location and spread. Every family is summarised
+    over one cohort — the scenarios usable at every level — so the report, the
+    tests and the figures describe the same scenarios;
+  - **corrupted test sets** from a fixed bank shared by all models (common
+    random numbers, independent of the GA seed): measurement noise, recording
+    noise of 0/1 inputs (one-hot groups re-drawn as one input),
+    under-recording, and values that become "not available". The corruptions
+    keep the structure of the data — one-hot groups stay valid, availability
+    flags (paired with their values by name first) are never re-drawn, and a
+    value whose flag says "not available" keeps its fill value — which is
+    checked after every corruption; combinations of 0/1 values merely never
+    seen in training are counted as a diagnostic, not prevented;
+  - per family and severity: the stressed score and its change from each
+    model's clean score, MORSE against every baseline (paired Wilcoxon tests
+    over the seeds), an exploratory sign-consistency-vs-degradation analysis,
+    five figures and `report.txt`.
 
-  **How the covariate shift is defined.** A covariate shift changes *which
-  patients are represented* (P(x)) while every patient keeps their own
-  (x, y) pair. Translating the feature values by a constant — the earlier
-  implementation — cannot do that for a logistic-regression score: every
-  logit moves by the same constant, the ranking of the patients is unchanged,
-  and ROC-AUC / PR-AUC are *exactly* invariant (verified on real runs:
-  bit-identical scores across all shift levels at zero noise). The shift is
-  therefore applied by **re-weighting the test patients**: the axis is the
-  first principal component (PC1) of the standardised training covariates
-  (the dominant direction of variation of the patient population), patient
-  *i* gets the weight `exp(strength · z_i)` with `z_i` its PC1 score in
-  training-SD units (clipped at ±2), normalised within each class so the
-  outcome prevalence is preserved exactly, and the metric is the weighted
-  ROC-AUC / PR-AUC of the unchanged predictions. Strength 0 is the ordinary
-  test set; ±1 tilts the population by about one SD towards the high / low
-  end of PC1. The effective sample size of the re-weighted test set is
-  printed for the extreme strengths (strong shifts are noisier by
-  construction, for every model alike). See
-  `evaluation_utils.covariate_shift_weights` for the full definition.
-
-  **How the binary noise is defined.** Every dummy cell is re-drawn with
-  probability *p* from a Bernoulli distribution with the column's *training
-  prevalence* (`evaluation_utils.apply_dummy_noise`); the other cells keep
-  their value. The earlier version re-drew from a fair coin, which floods a
-  rare flag with false positives: on RadFusion (57% of the binary columns
-  are below 5% prevalence) the noise variance at *p* = 0.1 was 2.8× the
-  signal variance of the rare columns but only 0.4× for the dense ones, so
-  the curve mostly measured how sparse each model's features are. The
-  re-draw keeps every column's prevalence and gives every column the same
-  correlation 1 − *p* with its clean version (0.90 at *p* = 0.1 for rare,
-  medium and dense columns alike); *p* = 1 leaves no information. Columns
-  are re-drawn independently, so associations between related columns are
-  not preserved for the re-drawn cells.
+- **Legacy stress grid** (`evaluation/all_models_comparison/`, optional block
+  after the suite, `RUN_LEGACY_STRESS_GRID`) — the robustness evaluation of runs
+  made before the suite, unchanged so that results stay comparable with them:
+  Gaussian noise × a covariate shift along the first principal component (a
+  re-weighting of the test rows, both directions), re-draw noise on the 0/1
+  inputs, and AURS (the fraction of each method's own clean score kept over the
+  grid). Its limits are the reasons for the suite: availability flags are
+  re-drawn like any 0/1 input, and AURS nets gains in one shift direction
+  against losses in the other.
 - **Feature-count comparison** — a boxplot + stripplot of the number of
   selected features per method across seeds, with per-seed and summary CSVs,
   showing the parsimony of each method.
@@ -360,22 +407,26 @@ corresponding code cells:
   it during selection. Read it together with the feature counts: a model with
   a single feature is trivially 100% consistent. Boxplot + per-seed and
   summary CSVs.
-- **Best-MORSE-model deployment report** — the seed whose MORSE model achieves
-  the highest test AUC is selected; at the balanced sensitivity ≈ specificity
-  threshold it reports accuracy, ROC-AUC, PR-AUC, F1, sensitivity, and
-  specificity (CSV), alongside the sensitivity/specificity-vs-threshold curve
-  (PDF).
+- **Best-MORSE-model report, chosen without the test set** — the seed whose
+  selected Pareto solution has the best cross-validated objective, and the
+  threshold at which sensitivity ≈ specificity on out-of-fold predictions of
+  the training data (`evaluation_utils.select_deployment_model`); the test set
+  is used once, to report accuracy, ROC-AUC, PR-AUC, F1, sensitivity,
+  specificity and balanced accuracy at that threshold (CSV), alongside the
+  out-of-fold sensitivity/specificity-vs-threshold curve (PDF). An earlier
+  version chose the seed and the threshold on the test set, which made its
+  numbers optimistic.
 
 ### Scope & possible extensions
 
 This repository deliberately focuses on the pipeline above. Analyses that a
 broader study might add — and that are **not** part of this codebase — include
-paired significance testing (e.g. Wilcoxon signed-rank tests across seeds),
 feature-selection **stability** (Jaccard similarity across seeds),
 **multicollinearity** diagnostics (VIF distributions of the selected
 features), and an explicit fold-vs-full-train sign-consistency verification.
-The fixed-split design documented above means any such significance test would
-speak to algorithmic reproducibility rather than cross-dataset generalisation.
+The fixed-split design documented above means that significance tests across
+seeds — including those of the robustness suite — speak to algorithmic
+reproducibility rather than to cross-dataset generalisation.
 
 ---
 
