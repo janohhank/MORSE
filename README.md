@@ -49,7 +49,10 @@ fitness values on stratified 3-fold cross-validation of the training set:
 
 1. **Predictive performance** — mean AUC of an L2-penalised logistic
    regression fit on each fold's training partition and scored on the fold's
-   validation partition. The AUC variant (ROC-AUC or PR-AUC) is configurable;
+   validation partition. The inputs are standardised inside every fold, with
+   the mean and SD of the fold's training partition, so no validation row
+   influences the scaling its fold model is fitted with (the same for all
+   three searches). The AUC variant (ROC-AUC or PR-AUC) is configurable;
    the shipped notebook uses **ROC-AUC** (`USE_ROC_AUC = True`), which does
    not depend on the class prevalence (PR-AUC suits strongly imbalanced tasks
    such as the readmission dataset).
@@ -174,9 +177,9 @@ RadFusion run.
 |---|---|
 | `multi_objective_training.MultiObjectiveTraining` | NSGA-II loop with the dual AUC + sign-consistency fitness. Uses DEAP's `selNSGA2` survival selection and `selTournamentDCD` mating selection; per-fold marginal correlations are computed internally on each fold's training partition. |
 | `single_objective_training.SingleObjectiveTraining` | Single-objective AUC-only GA (DEAP `eaMuPlusLambda`) used as the SO-GA baseline. |
-| `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector`. |
+| `forward_stepwise_training.ForwardStepwiseTraining` | Forward stepwise baseline wrapping sklearn's `SequentialFeatureSelector` (a `StandardScaler` + logistic-regression pipeline, so every CV fold is standardised on its own training rows). |
 | `all_features_training.AllFeaturesTraining` | No-selection baseline: returns the all-ones mask through the same `.run()` shape. |
-| `training_utils` | `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
+| `training_utils` | `standardised_folds` (the CV folds of the two GAs, each standardised on its own training rows), `save_stats_csv`, `ensure_directory`, `repository_root` (the folder every result directory is created in), and the Pareto-front selection helpers (`knee_point_index`, `best_sign_consistency_index`, `best_auc_index`, `select_pareto_individual`). |
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
 | `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `find_balanced_threshold`, and `select_deployment_model` / `out_of_fold_scores` (the best MORSE model and its threshold, chosen without the test set). The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
 | `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
@@ -290,7 +293,9 @@ contains a copy:
 Everything is plain CSV/JSON, written atomically: the files are readable,
 usable for the paper (fronts, masks) and independent of library versions.
 `fingerprint.json` records the training configuration, the cross-validation
-settings, the feature names and hashes of the training data. The fitted
+settings, how the inputs are standardised (`"standardisation": "per_fold"`:
+the trainers receive the unscaled training data and standardise every fold
+themselves), the feature names and hashes of the training data. The fitted
 logistic-regression models are rebuilt from the masks in seconds rather than
 pickled; their coefficients and scalers are recorded once in
 `evaluation/final_models_<rule>.json`, and every later re-evaluation must
@@ -314,7 +319,13 @@ SFS / all-features result);
 the evaluation runs again into the same directory. Resuming with different
 data or settings raises `CheckpointMismatchError` (listing what differs)
 instead of mixing results, while a change of the algorithm source code only
-warns. Runs made before checkpointing existed cannot be resumed — unless their
+warns. Runs made before 2026-09-28 standardised the whole training set once,
+before the search, so the validation rows of every fold took part in its
+scaling: their checkpoints cannot be resumed with the current code (their
+fingerprint has no `standardisation` entry), but they can still be evaluated
+again — the scripts below recognise them, check their data the way they were
+trained and re-score their fronts that way. Runs made before checkpointing
+existed cannot be resumed — unless their
 kernel is still alive: create the store exactly as in cell 9 and call
 `import_results(training_store, seeds, training_results_multi,
 training_results_single, training_results_fwd, training_results_all)` to write

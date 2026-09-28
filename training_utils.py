@@ -1,10 +1,37 @@
-"""Small, dependency-light utilities used by the GA training classes and
-the notebook.
+"""Small utilities used by the GA training classes and the notebook.
 """
 import csv
 import os
+from typing import Any
 
 import numpy
+from sklearn.preprocessing import StandardScaler
+
+
+def standardised_folds(X: numpy.ndarray, y: numpy.ndarray, cv: Any, standardise: bool = True
+                       ) -> list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]]:
+    """The cross-validation folds of (X, y): one (X_fold_train, X_fold_validation, y_fold_train,
+    y_fold_validation) tuple per split of `cv`.
+
+    With `standardise` (the default) every fold is standardised on its OWN training rows: a StandardScaler
+    fitted on the fold's training rows transforms the fold's training and validation rows. The scaling is
+    then fitted inside the cross-validation, like the model, so no validation row contributes to the mean
+    and SD its fold model is trained with. Standardisation works column by column, so the columns of a
+    feature subset are the same whether the subset or all inputs are standardised: the folds are built once
+    for all inputs, and a subset costs nothing extra.
+
+    `standardise=False` keeps the values of `X`. It only re-evaluates runs made before 2026-09-28, whose
+    notebook standardised the whole training set once before the search -- the validation rows of every fold
+    contributed to its scaling -- and must be given that globally standardised matrix."""
+    folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] = []
+    for train_idx, val_idx in cv.split(X, y):
+        X_fold_train: numpy.ndarray = X[train_idx]
+        X_fold_val: numpy.ndarray = X[val_idx]
+        if standardise:
+            scaler: StandardScaler = StandardScaler().fit(X_fold_train)
+            X_fold_train, X_fold_val = scaler.transform(X_fold_train), scaler.transform(X_fold_val)
+        folds.append((X_fold_train, X_fold_val, y[train_idx], y[val_idx]))
+    return folds
 
 
 def ensure_directory(directory: str) -> None:

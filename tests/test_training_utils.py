@@ -1,4 +1,5 @@
-"""Tests of training_utils: repository_root, the CSV writer, and the Pareto-front selection helpers.
+"""Tests of training_utils: repository_root, the CSV writer, the standardised cross-validation folds, and the
+Pareto-front selection helpers.
 
 Run from the repository root:
 
@@ -10,13 +11,17 @@ import sys
 import tempfile
 import unittest
 
+import numpy
+from sklearn.model_selection import StratifiedKFold
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from deap import creator  # noqa: E402
 
 from deap_types import ensure_multi_objective_types  # noqa: E402
 from training_utils import (best_auc_index, best_sign_consistency_index, ensure_directory,  # noqa: E402
-                            knee_point_index, repository_root, save_stats_csv, select_pareto_individual)
+                            knee_point_index, repository_root, save_stats_csv, select_pareto_individual,
+                            standardised_folds)
 
 
 def front(*points: tuple[float, float]) -> list:
@@ -72,6 +77,46 @@ class FileHelperTests(unittest.TestCase):
             path = os.path.join(directory, "empty.csv")
             save_stats_csv([], path)
             self.assertFalse(os.path.exists(path))
+
+
+class StandardisedFoldsTests(unittest.TestCase):
+    def setUp(self):
+        rng = numpy.random.default_rng(3)
+        self.X = rng.standard_t(df=2.0, size=(90, 4)) * [1.0, 10.0, 0.01, 3.0] + [0.0, 5.0, -2.0, 100.0]
+        self.X[:, 3] = 7.0                                                   # a constant input
+        self.y = (rng.random(90) < 0.4).astype(float)
+        self.cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    def test_every_fold_is_standardised_on_its_own_training_rows(self):
+        folds = standardised_folds(self.X, self.y, self.cv)
+        splits = list(self.cv.split(self.X, self.y))
+        self.assertEqual(len(folds), len(splits))
+        for (X_train, X_validation, y_train, y_validation), (train, validation) in zip(folds, splits):
+            mean, sd = self.X[train].mean(axis=0), self.X[train].std(axis=0)
+            numpy.testing.assert_allclose(X_train[:, :3].mean(axis=0), 0.0, atol=1e-12)
+            numpy.testing.assert_allclose(X_train[:, :3].std(axis=0), 1.0, rtol=1e-12)
+            # the validation rows get the mean and SD of the fold's TRAINING rows, not their own or the global ones
+            numpy.testing.assert_allclose(X_validation[:, :3], (self.X[validation, :3] - mean[:3]) / sd[:3],
+                                          rtol=1e-12, atol=1e-12)
+            self.assertFalse(numpy.allclose(X_validation[:, :3],
+                                            (self.X[validation, :3] - self.X[:, :3].mean(axis=0))
+                                            / self.X[:, :3].std(axis=0)))
+            numpy.testing.assert_array_equal(X_train[:, 3], 0.0)             # a constant input becomes 0
+            numpy.testing.assert_array_equal(y_train, self.y[train])
+            numpy.testing.assert_array_equal(y_validation, self.y[validation])
+
+    def test_a_subset_is_the_same_columns_of_the_standardised_folds(self):
+        columns = [2, 0]
+        for whole, subset in zip(standardised_folds(self.X, self.y, self.cv),
+                                 standardised_folds(self.X[:, columns], self.y, self.cv)):
+            numpy.testing.assert_array_equal(whole[0][:, columns], subset[0])
+            numpy.testing.assert_array_equal(whole[1][:, columns], subset[1])
+
+    def test_without_standardisation_the_rows_are_kept_as_they_are(self):
+        for (X_train, X_validation, _, _), (train, validation) in zip(
+                standardised_folds(self.X, self.y, self.cv, standardise=False), self.cv.split(self.X, self.y)):
+            numpy.testing.assert_array_equal(X_train, self.X[train])
+            numpy.testing.assert_array_equal(X_validation, self.X[validation])
 
 
 class ParetoSelectionTests(unittest.TestCase):

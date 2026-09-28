@@ -37,8 +37,8 @@ Statistics
 
 Checks before anything is scored
     * the training file must match the run's checkpoint fingerprint (feature names and the hashes of the
-      standardised training matrix and of the labels), so the models are refit on exactly the data the
-      run was trained on;
+      training matrix as the run's trainers received it and of the labels), so the models are refit on
+      exactly the data the run was trained on;
     * the recomputed ID test scores must reproduce the run's own per-seed results
       (evaluation/all_models_comparison/gaussian_2d_per_seed.csv), when the run folder has them.
 
@@ -71,7 +71,6 @@ import numpy
 import pandas
 from scipy.stats import rankdata, spearmanr, wilcoxon
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.preprocessing import StandardScaler
 
 # The pipeline modules live in the repository root, one level above this folder.
 REPOSITORY_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,7 +84,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from sklearn.model_selection import StratifiedKFold  # noqa: E402
 
 from checkpoint_utils import (FINGERPRINT_FILE, SeedTrainingResult, TrainingCheckpointStore,  # noqa: E402
-                              array_fingerprint, read_json)
+                              array_fingerprint, read_json, standardises_folds, trainer_inputs)
 from evaluation_utils import (build_model_package, compute_marginal_correlations,  # noqa: E402
                               compute_model_sign_consistency, predict_scores)
 from multi_objective_training import MultiObjectiveTraining  # noqa: E402
@@ -149,17 +148,18 @@ def load_split(path: str, target: str,
 
 def training_data_fingerprint(X_train: pandas.DataFrame, y_train: numpy.ndarray) -> dict[str, Any]:
     """The `features` and `data` parts of a checkpoint fingerprint, recomputed for a training file
-    exactly as training_notebook.ipynb computes them: the feature names, the float64 training matrix
-    AFTER the notebook's StandardScaler, and the float64 labels
-    (checkpoint_utils.build_training_fingerprint)."""
+    exactly as training_notebook.ipynb computes them: the feature names, the float64 labels and the
+    float64 training matrix as the trainers received it (checkpoint_utils.build_training_fingerprint)
+    -- under `data` unscaled (runs whose trainers standardise every fold), under `data_standardised`
+    standardised on the whole training file (runs made before 2026-09-28)."""
     names: list[str] = list(X_train.columns)
-    X_search: numpy.ndarray = numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64)
     y_search: numpy.ndarray = numpy.ascontiguousarray(y_train, dtype=numpy.float64)
     return {
         "features": {"count": len(names),
                      "sha256": hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()},
-        "data": {"X_train": array_fingerprint(StandardScaler().fit_transform(X_search)),
-                 "y_train": array_fingerprint(y_search)},
+        **{part: {"X_train": array_fingerprint(trainer_inputs(X_train.to_numpy(), per_fold)),
+                  "y_train": array_fingerprint(y_search)}
+           for part, per_fold in (("data", True), ("data_standardised", False))},
     }
 
 
@@ -168,11 +168,12 @@ def fingerprint_differences(saved: dict[str, Any], current: dict[str, Any]) -> l
     run was trained on this training file). Only the data and the feature names are compared: the GA
     settings and the code do not matter for re-scoring the saved models."""
     settings: dict[str, Any] = saved.get("settings", {})
+    data: dict[str, Any] = current["data"] if standardises_folds(saved) else current["data_standardised"]
     differences: list[str] = []
     if settings.get("features") != current["features"]:
         differences.append("the input variables (names or order) differ")
     for part in ("X_train", "y_train"):
-        if settings.get("data", {}).get(part) != current["data"][part]:
+        if settings.get("data", {}).get(part) != data[part]:
             differences.append(f"the training data ({part}) differ")
     return differences
 
@@ -312,15 +313,16 @@ def evaluate_models(results: dict[int, SeedTrainingResult], features: list[str],
 def cv_evaluator(fingerprint: dict[str, Any], X_train: pandas.DataFrame, y_train: numpy.ndarray,
                  features: list[str]) -> MultiObjectiveTraining:
     """The run's own fitness function (MultiObjectiveTraining.evaluate_multi) on the run's data and folds:
-    the training matrix standardised as in the notebook, the CV splitter of the checkpoint fingerprint."""
+    the CV splitter of the checkpoint fingerprint, and the inputs standardised as the run did it -- every
+    fold on its own training rows, or (runs made before 2026-09-28) the whole training file once."""
     cv_settings: dict[str, Any] = fingerprint["settings"]["cv"]
     cv = StratifiedKFold(n_splits=cv_settings["n_splits"], shuffle=cv_settings["shuffle"],
                          random_state=cv_settings["random_state"])
-    X_search: numpy.ndarray = StandardScaler().fit_transform(
-        numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64))
+    per_fold: bool = standardises_folds(fingerprint)
+    X_search: numpy.ndarray = trainer_inputs(X_train.to_numpy(), per_fold)
     y_search: numpy.ndarray = numpy.ascontiguousarray(y_train, dtype=numpy.float64)
     config = TrainingConfig(seed=0, use_roc_auc=bool(fingerprint["settings"]["training_config"]["use_roc_auc"]))
-    return MultiObjectiveTraining(config, features, X_search, y_search, cv)
+    return MultiObjectiveTraining(config, features, X_search, y_search, cv, standardise_folds=per_fold)
 
 
 def evaluate_front_solutions(results: dict[int, SeedTrainingResult], features: list[str],

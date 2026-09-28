@@ -20,6 +20,7 @@ from unittest import mock
 import numpy
 from deap import creator
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -115,6 +116,41 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertTrue(any("numpy" in n for n in notes), notes)
         self.assertTrue(any("checkpoint_utils.py changed" in n for n in notes), notes)
+
+    def test_the_fingerprint_records_that_every_fold_is_standardised(self):
+        fingerprint = make_fingerprint()
+        self.assertEqual(fingerprint["settings"]["standardisation"], cu.STANDARDISATION)
+        self.assertTrue(cu.standardises_folds(fingerprint))
+        self.assertFalse(cu.standardises_folds(legacy_fingerprint(fingerprint)))
+        self.assertFalse(cu.standardises_folds({}))
+
+    def test_checkpoints_of_runs_standardised_as_a_whole_are_not_resumed(self):
+        current = make_fingerprint()
+        problems, _ = cu.compare_fingerprints(legacy_fingerprint(current), current)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("standardised as a whole", problems[0])
+        with tempfile.TemporaryDirectory() as directory:
+            cu.TrainingCheckpointStore(directory, legacy_fingerprint(current)).prepare()
+            with self.assertRaisesRegex(cu.CheckpointMismatchError, "standardised as a whole"):
+                cu.TrainingCheckpointStore(directory, current).prepare()
+
+    def test_the_trainer_inputs_of_both_kinds_of_run(self):
+        X = numpy.asfortranarray(numpy.random.RandomState(1).randn(30, 4) * [1.0, 5.0, 0.1, 20.0] + 3.0)
+        unscaled = cu.trainer_inputs(X, per_fold=True)
+        self.assertEqual(unscaled.dtype, numpy.float64)
+        self.assertTrue(unscaled.flags["C_CONTIGUOUS"])
+        numpy.testing.assert_array_equal(unscaled, X)
+        # standardised as the notebook did it: of the C-contiguous matrix (the memory order changes the last bits,
+        # and the fingerprint hashes the bytes)
+        numpy.testing.assert_array_equal(cu.trainer_inputs(X, per_fold=False),
+                                         StandardScaler().fit_transform(numpy.ascontiguousarray(X)))
+
+
+def legacy_fingerprint(fingerprint: dict) -> dict:
+    """The fingerprint of a run made before 2026-09-28, which has no standardisation entry."""
+    legacy = json.loads(json.dumps(fingerprint))
+    del legacy["settings"]["standardisation"]
+    return legacy
 
 
 class StoreTests(unittest.TestCase):
