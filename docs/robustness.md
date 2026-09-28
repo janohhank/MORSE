@@ -49,7 +49,8 @@ Only real rows are re-emphasised, so a re-weighting cannot produce an impossible
 and needs no knowledge of what the features mean.
 
 **Corrupted test sets** change recorded values: measurement noise, recording errors, lost records,
-values that are not available. A corruption does not keep P(y | observed x). It also has to keep the data
+values that are not available, numerical values replaced by their training median. A corruption does not
+keep P(y | observed x). It also has to keep the data
 valid by its **structural** rules: a one-hot group keeps at most one level (exactly one if it is
 exhaustive), and a value whose flag says "not measured" holds its fill value. Those rules are inferred
 from the names and the training data (next section) and checked after every corruption. A combination of
@@ -240,10 +241,21 @@ re-weighted prevalence is recorded in `scenarios.csv`.
 | recording noise | every stand-alone 0/1 input, and every one-hot group as one categorical input, is re-drawn from its training distribution with probability p |
 | under-recording | every recorded 1 of a stand-alone 0/1 input with training prevalence below 50% is lost (set to 0) with probability p |
 | values not available | every available value with an availability flag becomes "not available" (flag set, fill value) with probability p, each flag on its own: at p = 1 every value is withheld |
+| numerical values masked | every available value of a continuous input is replaced by its training median with probability p, cell by cell; every 0/1 input, availability flags included, is left unchanged, so the data do not say that the value was lost: at p = 1 every continuous input is constant |
+
+Values not available and numerical values masked both remove numerical information. The first keeps the
+representation the preprocessing gives a missing value (the flag says so), so it needs availability flags
+and applies only to datasets that have them (College Scorecard, RadFusion). The second is the same
+operation on every dataset, including one without flags (Arrhythmia), so every dataset can be evaluated
+with it. The same level is not equally hard on different datasets, since they differ in how many
+continuous inputs they have and how much the models rely on them; the comparison is between the methods,
+within a dataset, on the same corrupted rows.
 
 The levels are 0.1, 0.2, …, 1.0 (`corruption_levels`). The **corruption bank** holds 10 realisations
 per family (`corruption_repetitions`). Their random draws come from their own seed (`corruption_seed`),
-one stream per family, independent of the GA seed. Every model is scored on the very same corrupted
+one stream per family, independent of the GA seed. The streams are spawned in the order of
+`CORRUPTION_FAMILIES`, and a new family is appended to it, so adding one leaves the corrupted test sets of
+the others unchanged. Every model is scored on the very same corrupted
 data, and the same draws are reused at every level (**common random numbers**): the Gaussian noise at
 0.4 is exactly twice that at 0.2, and the cells corrupted at a level are a subset of those corrupted at
 any higher level. Nothing is undone, so a level means what it says: at level p a share p of the eligible
@@ -330,6 +342,9 @@ every seed, that band was pure corruption noise. The bank separates the two.
   count them.
 * Measurement noise ignores bounds and integer values: the models are frozen linear scores, so this
   changes no computation, but a noisy count can be negative.
+* Numerical values masked uses the median of the preprocessed training column. Where the preprocessing
+  imputed missing values with the training median, this is also their fill value, so a masked value looks
+  like an imputed one whose flag was not set.
 * Under-recording applies to every stand-alone 0/1 input with a prevalence below 50%. The rule cannot
   tell a record (a diagnosis code) from an attribute (an institution type).
 * The robustness evaluation of runs made before the suite — the Gaussian noise × PC1 covariate-shift
