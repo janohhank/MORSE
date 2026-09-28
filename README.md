@@ -10,8 +10,8 @@ robustness objective: the **sign agreement between each feature's marginal
 correlation with the target and its fitted regression coefficient**. The two
 objectives are co-optimised over the space of binary feature-subset
 indicators, producing a Pareto front of (AUC, sign-consistency) trade-offs
-from which a single deployment model is then chosen — for example via the
-**knee point** of the front.
+from which the final model is then chosen: the **max-S end** of the front
+(its most sign-consistent solution, the default) or its **knee point**.
 
 ---
 
@@ -34,10 +34,11 @@ Such sign-inconsistent models tend to:
 - Conflict with **domain knowledge**: a clinician or financial analyst can
   inspect the fitted coefficients and immediately spot the implausible signs.
 
-MORSE's hypothesis — empirically probed on the clinical / risk-scoring
-datasets in this repository — is that **explicitly penalising sign
-inconsistency during feature selection yields more parsimonious models with
-better robustness to noise**, at a modest cost in clean-test AUC.
+MORSE's hypothesis — empirically probed on the clinical, risk-scoring and
+higher-education datasets in this repository — is that **explicitly
+penalising sign inconsistency during feature selection yields more
+parsimonious models that are more robust to test-time perturbations and to
+distribution shift**, possibly at some cost in clean-test AUC.
 
 ---
 
@@ -49,20 +50,26 @@ fitness values on stratified 3-fold cross-validation of the training set:
 1. **Predictive performance** — mean AUC of an L2-penalised logistic
    regression fit on each fold's training partition and scored on the fold's
    validation partition. The AUC variant (ROC-AUC or PR-AUC) is configurable;
-   the shipped notebook uses **PR-AUC** (`USE_ROC_AUC = False`), which suits
-   the class-imbalanced readmission dataset.
+   the shipped notebook uses **ROC-AUC** (`USE_ROC_AUC = True`), which does
+   not depend on the class prevalence (PR-AUC suits strongly imbalanced tasks
+   such as the readmission dataset).
 2. **Sign consistency** — for the fitted coefficients `β_k` of the selected
    features, the fraction whose product `corr(x_k, y) · β_k` is strictly
    positive (computed per fold on the fold's training partition; the
    negative-or-near-zero fraction is the penalty).
 
 NSGA-II (via DEAP) is run over the population of feature masks. From each
-seed's final Pareto front, the deployable model is selected by the
-**knee-point** heuristic (maximum perpendicular distance from the line
-connecting the two extreme candidates of the Pareto front) or, optionally, by
-the **best sign-consistency** point (`USE_KNEE_POINT_SELECTION`). The final
-logistic regression is **refit on the full training set** (with a fresh
-`StandardScaler`) on the selected feature subset for downstream evaluation.
+seed's final Pareto front, the final model is the **max-S end** — the
+solution with the best sign consistency, which, being non-dominated, is also
+the most accurate among the most consistent solutions
+(`USE_KNEE_POINT_SELECTION = False`, the default) — or the **knee point**
+(maximum perpendicular distance from the line connecting the two extreme
+candidates of the normalised front; `USE_KNEE_POINT_SELECTION = True`). The
+rule only picks a solution of the finished front and does not affect
+training, so a finished run can be evaluated with the other rule without
+retraining. The final logistic regression is **refit on the full training
+set** (with a fresh `StandardScaler`) on the selected feature subset for
+downstream evaluation.
 
 The repository compares MORSE against three baselines: a single-objective GA
 (AUC only), forward stepwise selection via scikit-learn, and the no-selection
@@ -71,9 +78,13 @@ random seeds** on a **single fixed test set**, clean and under the
 **robustness suite**: test-set stresses generated automatically from the data,
 without naming any feature (re-weighted test populations — principal-component
 and dependence shifts — and corrupted test sets — measurement noise, recording
-noise, under-recording, values not available; see
-[docs/robustness.md](docs/robustness.md)). Results are reported as
-**mean ± 1 standard deviation across seeds**, with paired tests over the seeds. See
+noise, under-recording, values not available, numerical values masked; see
+[docs/robustness.md](docs/robustness.md)). On College Scorecard the final
+models are also scored on a **real out-of-domain test set**, the institution
+types that TableShift holds out (see
+[the natural shift](#the-natural-distribution-shift-of-college-scorecard)).
+Results are reported as **mean ± 1 standard deviation across seeds**, with
+paired tests over the seeds. See
 [Numerical reproducibility](#numerical-reproducibility) for exactly what the
 seed varies — this is a deliberate design choice.
 
@@ -114,6 +125,17 @@ seed varies — this is a deliberate design choice.
 │   ├── arrhythmia_preprocessed_train_data.csv
 │   └── arrhythmia_preprocessed_test_data.csv
 │
+├── college_scorecard/               # U.S. Department of Education College Scorecard (TableShift task)
+│   ├── CollegeScorecardDataDictionary.xlsx
+│   ├── college_scorecard_data_preparation.ipynb
+│   ├── college_scorecard_ood_evaluation.py         # natural-shift evaluation of a finished run
+│   ├── college_scorecard_preprocessed_train_data.csv
+│   ├── college_scorecard_preprocessed_test_data.csv
+│   └── college_scorecard_preprocessed_ood_test_data.csv  # the held-out institution types
+│
+├── radfusion/                       # RadFusion EHR preprocessing (the data are not redistributed)
+│   └── radfusion_ehr_preprocess.ipynb
+│
 └── readmit/                         # UCI Diabetes 130-US Hospitals dataset
     ├── diabetic_data.csv
     ├── readmit_130_hospitals_data_preparation.ipynb
@@ -121,12 +143,30 @@ seed varies — this is a deliberate design choice.
     └── readmit_130_hospitals_preprocessed_test_data.csv
 ```
 
-A third dataset (**RadFusion** — Electronic Health Records and CTPA imaging
-for pulmonary-embolism detection) was used in the wider study but is **not
-redistributed** here because of its access-controlled licence, and is **not
-wired into this public notebook** (only the `arrhythmia` and `readmit` config
-blocks are present in cell 2). To reproduce the RadFusion results, obtain the
-data through its official access pathway and add a matching config block.
+**College Scorecard** is public-domain U.S. government data. Its raw download
+(`Most-Recent-Cohorts-Institution.csv`, about 100 MB) is not committed; the
+preparation notebook names the file and its download link, and the three
+preprocessed CSVs it produces are committed. The task definition (119
+institutional features; the label is `C150_4 > 0.5`, i.e. more than half of
+the first-time, full-time students complete their studies within 150% of the
+normal time) and the out-of-domain split (eight Carnegie Classification types
+held out) follow TableShift. The preprocessing is MORSE's own — training-only
+median imputation with missing-value flags and one-hot codes instead of
+TableShift's binning for tree models — so that the signs of the inputs stay
+interpretable.
+
+**RadFusion** (the electronic health records of a CT pulmonary angiography
+cohort, pulmonary-embolism detection) is **not redistributed** because of its
+access-controlled licence. Its preprocessing notebook is included: with the
+raw EHR tables obtained through the dataset's official access pathway, it
+writes the CSVs that the RadFusion block of the notebook's cell 2 reads, and
+cells 3 and 4 then select the RadFusion inputs with an explicit column list.
+Two ICD groups in that list may encode the outcome itself:
+`DISEASES OF PULMONARY CIRCULATION:presence` contains the codes of pulmonary
+embolism, and `DISEASES OF VEINS AND LYMPHATICS, AND OTHER DISEASES OF
+CIRCULATORY SYSTEM:presence` those of venous thrombosis. The MORSE
+experiments exclude both, so remove them from the two column lists before a
+RadFusion run.
 
 ### Key modules at a glance
 
@@ -140,12 +180,13 @@ data through its official access pathway and add a matching config block.
 | `plot_utils` | Every figure: single/multi-objective convergence, the Pareto front (highlighting the three canonical candidates), the five robustness-suite figures, the legacy stress grid's line plots and heatmap grid, the sensitivity/specificity curve, the feature-count boxplot, and the sign-consistency boxplot. |
 | `evaluation_utils` | `compute_marginal_correlations` (Matthews / point-biserial), `build_model_package` (final refit on full train), `predict_scores` / `score_predictions` / `evaluate_model` (optionally weighted metrics), `compute_model_sign_consistency` (sign consistency of a final model), `find_balanced_threshold`, and `select_deployment_model` / `out_of_fold_scores` (the best MORSE model and its threshold, chosen without the test set). The stress tests of the legacy stress grid (`apply_proportional_noise`, `apply_dummy_noise`, `fit_covariate_shift_axis` / `covariate_shift_weights`, column-type detection) and its summary `compute_aurs`. |
 | `robustness_config` | `RobustnessConfig`: every setting of the robustness suite (severity levels, pair eligibility, support thresholds, corruption levels and bank size), the same for every dataset. |
-| `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers). |
+| `robustness_utils` | The robustness suite's building blocks: weighted ROC-AUC / average precision and effective sample size, `infer_feature_schema` (types, one-hot groups, values with their availability flags — by name first, statistically for shared flags — and, as a diagnostic, 0/1 combinations never seen in training), `population_axes` and `dependence_pairs` / `DependenceTilt` (re-weighted test populations, calibrated by `calibrate_strengths` to a training ESS), and `CorruptionBank` (a fixed bank of corrupted test sets with common random numbers: measurement noise, recording noise, under-recording, values not available, numerical values masked). |
 | `robustness_evaluation` | `build_final_models` and `run_robustness_suite` (every final model under every scenario; tables, tests, figures, report), `load_run_models` (a finished run rebuilt from its checkpoints), plus the stand-alone entry point `python robustness_evaluation.py --run <result folder>`. See [docs/robustness.md](docs/robustness.md). |
 | `legacy_stress_evaluation` | `run_legacy_stress_grid`: the robustness evaluation of runs made before the suite (Gaussian noise × PC1 covariate-shift grid, 0/1 re-draw noise, AURS), unchanged — it reproduces those runs' CSVs byte for byte — as an optional notebook block and as `python legacy_stress_evaluation.py --run <result folder>`. |
 | `run_manifest` | `run_manifest.json`, written when a run starts (data files and hashes, input order, objective, Pareto rule, settings), and `load_run_data`, which rebuilds a finished run's data from it — or from a notebook copy for older runs — plus `verify_training_data` against the checkpoint fingerprint. |
 | `checkpoint_utils` | Checkpointing of the training stage: `TrainingCheckpointStore` (one folder per finished seed with the MORSE Pareto front as CSV, the SO-GA / SFS / all-features masks, a completion marker, and a fingerprint of the data and settings), `train_missing_seeds` (trains only the seeds without a checkpoint and saves each seed the moment it finishes), and atomic-write helpers. |
 | `deap_types` | The DEAP fitness / individual classes (`FitnessMulti` / `Individual`, `FitnessSingle` / `IndividualSingle`), defined once for the trainers, the notebook and the checkpoint loader. |
+| `college_scorecard/college_scorecard_ood_evaluation` | The natural-shift evaluation of a College Scorecard run ([see below](#the-natural-distribution-shift-of-college-scorecard)): every final model and every front solution, refit from the checkpoints, on the in-domain test set and on the held-out institution types, with paired tests over the seeds and bootstrap intervals over the institutions. |
 
 ---
 
@@ -173,25 +214,38 @@ roughly 30–90 minutes per dataset, depending on the feature count.
 
 ### (Optional) regenerate the preprocessed CSVs
 
-The preprocessed train/test CSVs are committed, so you can run the training
-notebook directly. To regenerate them from the raw data, run the per-dataset
-preparation notebook (`arrhythmia/arrhythmia_data_preparation.ipynb` or
-`readmit/readmit_130_hospitals_data_preparation.ipynb`). Both fit all
-data-dependent preprocessing (e.g. median imputation) on the **training
-partition only**, after the train/test split, so no test-set information
-leaks into the training data.
+The preprocessed CSVs of Arrhythmia, College Scorecard and Diabetes 130-US
+are committed, so you can run the training notebook directly. To regenerate
+them from the raw data, run the per-dataset preparation notebook
+(`arrhythmia/arrhythmia_data_preparation.ipynb`,
+`college_scorecard/college_scorecard_data_preparation.ipynb` after
+downloading the raw file it names, or
+`readmit/readmit_130_hospitals_data_preparation.ipynb`); RadFusion's
+(`radfusion/radfusion_ehr_preprocess.ipynb`) needs the access-controlled raw
+tables. All of them fit the data-dependent preprocessing (e.g. median
+imputation) on the **training partition only**, after the train/test split,
+so no test-set information leaks into the training data.
 
 ### Run the pipeline
 
 1. Open `training_notebook.ipynb` in Jupyter (or VS Code's notebook UI).
-2. In **cell 2**, select the dataset by (un)commenting the config block:
-   `arrhythmia` (active by default) or `readmit`.
+2. In **cell 2**, select the dataset by (un)commenting its config block:
+   `arrhythmia`, `readmit`, `college_scorecard` or `radfusion` (the committed
+   notebook has the RadFusion block active; see the RadFusion note above).
 3. Optionally edit the run switches in the same cell:
    - `N_JOBS` (default `-1`, all cores; one worker process per seed),
-   - `USE_KNEE_POINT_SELECTION` (default `True`),
-   - `USE_ROC_AUC` (default `False` → PR-AUC is the main objective/metric),
-   - `RESUME_FROM` (default `None`; the result directory of an earlier run to
-     continue without retraining, see [Checkpoints](#checkpoints-and-resuming-a-run)).
+   - `USE_KNEE_POINT_SELECTION` (default `False` → the max-S end of every
+     front; `True` → the knee point),
+   - `USE_ROC_AUC` (default `True` → ROC-AUC is the main objective/metric;
+     `False` → PR-AUC),
+   - `RESUME_FROM` (default `None`, which starts a **new** run; the result
+     directory of an earlier run to continue or re-evaluate it without
+     retraining, see [Checkpoints](#checkpoints-and-resuming-a-run)).
+
+   The GA settings (population size 188, 650 generations, crossover and
+   mutation probabilities) are the defaults of `training_config.py`; edit them
+   there. A resumed run must use the settings its checkpoints record (for
+   example `ngen = 1000` for a run that was trained with 1000 generations).
 4. **Run all cells.** Outputs are written to a timestamped directory in the
    **repository root** — whatever working directory the kernel was started in
    (the path is printed at the start of the run). Run `training_notebook.ipynb`
@@ -210,7 +264,8 @@ YYYY-MM-DD_HH-MM-SS/
     ├── all_models_comparison/            # legacy stress grid (optional block): per-seed CSVs, AURS, four figures
     ├── feature_counts/                   # feature-count boxplot + per-seed / summary CSVs
     ├── sign_consistency/                 # sign consistency of the 4 final models: boxplot + per-seed / summary CSVs
-    └── best_morse_model/                 # the model chosen without the test set: metrics CSV + curve PDF
+    ├── best_morse_model/                 # the model chosen without the test set: metrics CSV + curve PDF
+    └── ood_test/                         # College Scorecard only: the natural-shift evaluation (separate script)
 ```
 
 ### Checkpoints and resuming a run
@@ -271,7 +326,7 @@ The robustness suite needs only the checkpoints, so it can be run again — with
 changed settings or a newer version of the suite — without retraining:
 
 ```bash
-python robustness_evaluation.py --run 2026-09-25_14-06-20_college_scorecard_pr
+python robustness_evaluation.py --run <result folder>
 ```
 
 The run's data are rebuilt from its `run_manifest.json` (the recorded CSV
@@ -293,11 +348,33 @@ of the manifest and the checkpoint fingerprint. See
 The legacy stress grid works the same way:
 
 ```bash
-python legacy_stress_evaluation.py --run 2026-09-25_16-05-04_radfusion_pr
+python legacy_stress_evaluation.py --run <result folder>
 ```
 
 writes `<run>/evaluation/all_models_comparison/` (`..._<rule>` / `..._roc` /
 `..._pr` when the rule or the metric differs from the run's own).
+
+### The natural distribution shift of College Scorecard
+
+The 945 institutions of the Carnegie Classification types that TableShift
+holds out are never used during training or selection. A finished College
+Scorecard run is scored on them without retraining:
+
+```bash
+python college_scorecard/college_scorecard_ood_evaluation.py --run <result folder>
+```
+
+Without `--run`, the newest run folder whose checkpoints were trained on the
+College Scorecard training file is used. The script refits every final model
+(the three front positions of MORSE, the SO-GA, SFS and the all-features
+model) and every distinct front solution from the checkpoints, checks the
+recomputed in-domain scores against the run's own results, and reports the
+in-domain and out-of-domain ROC-AUC, the raw and prevalence-calibrated
+PR-AUC, the drop between them, paired Wilcoxon tests of MORSE against every
+baseline over the seeds and bootstrap intervals over the institutions.
+`--selection auto|max_s|knee` picks the MORSE model that is compared with the
+baselines (`auto` = the run's own rule). The outputs go to
+`<run>/evaluation/ood_test/`.
 
 ### Numerical reproducibility
 
@@ -342,7 +419,15 @@ varies is the GA's own algorithmic stochasticity. This is deliberate:
   notebook's first cell caps `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
   `OMP_NUM_THREADS`, and `BLIS_NUM_THREADS` to 1 **before** `numpy` is
   imported, so the per-worker BLAS pool does not oversubscribe cores against
-  the `joblib` loky worker pool.
+  the `joblib` loky worker pool. In a kernel that has already imported
+  `numpy`, the cap has no effect.
+- **BLAS threads and the final-model record.** The L-BFGS fit of a large
+  model depends slightly on the BLAS thread count (up to 7.7e-7 in the
+  coefficients of a 293-input model), more than the 1e-8 that the check
+  against `evaluation/final_models_<rule>.json` allows. Re-evaluate a run with
+  the BLAS threading its record was made with; the command-line evaluations
+  (`robustness_evaluation.py`, `legacy_stress_evaluation.py`) do not cap the
+  threads.
 
 ---
 
@@ -375,7 +460,10 @@ corresponding code cells:
   - **corrupted test sets** from a fixed bank shared by all models (common
     random numbers, independent of the GA seed): measurement noise, recording
     noise of 0/1 inputs (one-hot groups re-drawn as one input),
-    under-recording, and values that become "not available". The corruptions
+    under-recording, values that become "not available" (value and flag),
+    and numerical values masked (continuous inputs set to their training
+    median, every 0/1 input and flag unchanged — the one masking that applies
+    to every dataset, with or without availability flags). The corruptions
     keep the structure of the data — one-hot groups stay valid, availability
     flags (paired with their values by name first) are never re-drawn, and a
     value whose flag says "not available" keeps its fill value — which is
@@ -438,18 +526,19 @@ community**:
 - **Code**: all source, configuration, and evaluation logic are released
   under the repository's open licence — no closed-source components, no
   proprietary dependencies beyond standard Python scientific libraries.
-- **Datasets**: the two redistributable datasets used in the empirical study
-  (Arrhythmia and Diabetes 130-US Hospitals) are included alongside their
-  preprocessing notebooks and preprocessed CSVs. The third dataset (RadFusion)
-  is access-controlled and is documented but not wired into this notebook.
+- **Datasets**: the redistributable datasets (Arrhythmia, College Scorecard
+  and Diabetes 130-US Hospitals) are included alongside their preprocessing
+  notebooks and preprocessed CSVs (the raw College Scorecard download is
+  regenerable and not committed). RadFusion is access-controlled: its
+  preprocessing notebook is included, its data are not.
 - **Reproducibility**: dependencies are pinned in `requirements.txt`, the
   preprocessing is leakage-free (all fitted steps learn from the training
   partition only), and the timestamped output directory captures every plot
   and CSV. Re-running the notebook on the same dataset configuration
   reproduces the results within floating-point precision.
-- **Methodology transparency**: every methodological choice (knee-point
-  selection, 3-fold inner CV, the fixed-split / algorithmic-randomness design,
-  20 seeds) is documented in inline markdown cells and in this README.
+- **Methodology transparency**: every methodological choice (the Pareto-front
+  selection rule, 3-fold inner CV, the fixed-split / algorithmic-randomness
+  design, 20 seeds) is documented in inline markdown cells and in this README.
 
 Issues, replication attempts, and extensions are very welcome. If you reuse
 the sign-consistency objective or the MORSE pipeline in your own work,
@@ -481,6 +570,22 @@ output that is independent of any AI-generated content.
 > Guvenir, H. A. (1998). *Arrhythmia* [Dataset]. UCI Machine Learning
 > Repository. https://doi.org/10.24432/C5BS32
 
+### College Scorecard (U.S. Department of Education, 2026)
+
+> U.S. Department of Education. (2026). *College Scorecard: Most Recent
+> Cohorts, Institution-Level Data* (file
+> `Most-Recent-Cohorts-Institution_06102026.zip`, released 10 June 2026)
+> [Dataset]. https://collegescorecard.ed.gov/data/ (accessed 25 September
+> 2026).
+
+The task definition (features and label) and the out-of-domain split (the
+held-out Carnegie Classification types) follow TableShift:
+
+> Gardner, J., Popović, Z., & Schmidt, L. (2023). Benchmarking distribution
+> shift in tabular data with TableShift. In *Advances in Neural Information
+> Processing Systems 36 (NeurIPS 2023), Datasets and Benchmarks Track*.
+> https://arxiv.org/abs/2312.07577
+
 ### Diabetes 130-US Hospitals for Years 1999-2008 — "Readmit" (UCI Machine Learning Repository, 2014)
 
 > Strack, B., DeShazo, J. P., Gennings, C., Olmo, J. L., Ventura, S.,
@@ -493,3 +598,11 @@ output that is independent of any AI-generated content.
 > Cios, K. J., & Clore, J. N. (2014). *Diabetes 130-US Hospitals for Years
 > 1999-2008* [Dataset]. UCI Machine Learning Repository.
 > https://doi.org/10.24432/C5230J
+
+### RadFusion (not redistributed; access-controlled)
+
+> Zhou, Y., Huang, S.-C., Fries, J. A., Youssef, A., Amrhein, T. J.,
+> Chang, M., Banerjee, I., Rubin, D., Xing, L., Shah, N., & Lungren, M. P.
+> (2021). RadFusion: Benchmarking performance and fairness for multimodal
+> pulmonary embolism detection from CT and EHR. *arXiv preprint*
+> arXiv:2111.11665. https://arxiv.org/abs/2111.11665
