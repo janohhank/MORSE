@@ -240,7 +240,7 @@ class CorruptionTests(unittest.TestCase):
 
     def test_every_family_applies_and_level_zero_is_the_clean_test_set(self):
         self.assertEqual(self.bank.applicable_families(),
-                         ["gaussian_noise", "binary_redraw", "under_recording", "value_masking"])
+                         ["gaussian_noise", "binary_redraw", "under_recording", "value_masking", "median_masking"])
         for family in self.bank.applicable_families():
             corrupted, counts = self.bank.corrupt(family, 0.0, 0)
             pandas.testing.assert_frame_equal(corrupted, self.X_test.astype(float))
@@ -251,7 +251,7 @@ class CorruptionTests(unittest.TestCase):
         low, _ = self.bank.corrupt("gaussian_noise", 0.3, 1)
         high, _ = self.bank.corrupt("gaussian_noise", 0.6, 1)
         numpy.testing.assert_allclose((high - clean)[["x1", "x2"]].to_numpy(), 2 * (low - clean)[["x1", "x2"]].to_numpy())
-        for family in ("binary_redraw", "under_recording", "value_masking"):
+        for family in ("binary_redraw", "under_recording", "value_masking", "median_masking"):
             low_changed = (self.bank.corrupt(family, 0.3, 2)[0] != clean).to_numpy()
             high_changed = (self.bank.corrupt(family, 0.7, 2)[0] != clean).to_numpy()
             self.assertTrue(low_changed.any())
@@ -303,6 +303,49 @@ class CorruptionTests(unittest.TestCase):
         unavailable = clean["lab_measured"] == 0
         self.assertTrue((noisy.loc[unavailable, "lab"] == FILL).all())
         self.assertTrue((noisy.loc[~unavailable, "lab"] != clean.loc[~unavailable, "lab"]).all())
+
+    def test_median_masking_sets_numerical_values_to_their_training_median_and_keeps_every_flag(self):
+        clean = self.X_test.astype(float)
+        continuous = ["x1", "x2", "lab"]
+        self.assertEqual(sorted(self.schema.continuous), sorted(continuous))
+        medians = self.X[continuous].median()
+        masked, counts = self.bank.corrupt("median_masking", 0.6, 0)
+        changed = masked != clean
+        # only numerical values change, each to the training median of its input ...
+        self.assertTrue(set(changed.columns[changed.any()]) <= set(continuous))
+        for name in continuous:
+            self.assertTrue(changed[name].any(), name)
+            self.assertTrue((masked.loc[changed[name], name] == medians[name]).all(), name)
+        # ... every 0/1 input, the availability flag included, is left as it is, and a value that is not
+        # available keeps its fill value
+        binary = [name for name in clean.columns if name not in continuous]
+        pandas.testing.assert_frame_equal(masked[binary], clean[binary])
+        unavailable = clean["lab_measured"] == 0
+        self.assertTrue((masked.loc[unavailable, "lab"] == FILL).all())
+        self.assertEqual(counts["eligible"], 2 * len(clean) + int((~unavailable).sum()))
+        self.assertEqual(counts["unseen_combinations"], 0)
+        # at level 1 every available numerical value is the median
+        full, counts = self.bank.corrupt("median_masking", 1.0, 1)
+        self.assertTrue((full[["x1", "x2"]] == medians[["x1", "x2"]]).all().all())
+        self.assertTrue((full.loc[~unavailable, "lab"] == medians["lab"]).all())
+        self.assertEqual(counts["selected"], counts["eligible"])
+
+    def test_the_appended_family_leaves_the_streams_of_the_others_unchanged(self):
+        # the streams are spawned in the order of CORRUPTION_FAMILIES, and median_masking was appended to
+        # the four original families: their draws are those of a bank without it (seed 11, 3 repetitions)
+        clean = self.X_test.astype(float)
+        streams = numpy.random.SeedSequence(11).spawn(4)
+        z = numpy.random.default_rng(streams[0].spawn(3)[1]).standard_normal((len(clean), 3))
+        noisy, _ = self.bank.corrupt("gaussian_noise", 1.0, 1)
+        scale = self.X[self.schema.continuous].std().to_numpy()
+        for j, name in enumerate(self.schema.continuous):
+            rows = (clean["lab_measured"] == 1).to_numpy() if name == "lab" else numpy.ones(len(clean), dtype=bool)
+            numpy.testing.assert_allclose(noisy[name].to_numpy()[rows], clean[name].to_numpy()[rows]
+                                          + z[rows, j] * scale[j], rtol=0, atol=1e-12)
+        select = numpy.random.default_rng(streams[3].spawn(3)[0]).random((len(clean), 1))[:, 0] < 0.5
+        masked, _ = self.bank.corrupt("value_masking", 0.5, 0)
+        withheld = (clean["lab_measured"] == 1) & (masked["lab_measured"] == 0)
+        numpy.testing.assert_array_equal(withheld.to_numpy(), (clean["lab_measured"] == 1).to_numpy() & select)
 
 
 def make_availability_data(n: int, seed: int) -> pandas.DataFrame:
@@ -500,16 +543,20 @@ class CorruptionBankErrorTests(unittest.TestCase):
 
     def test_describe_counts_the_units(self):
         self.assertEqual(self.bank.describe(), {"gaussian_noise": 3, "binary_redraw": 11, "under_recording": 6,
-                                                "value_masking": 1})
+                                                "value_masking": 1, "median_masking": 3})
 
     def test_only_continuous_inputs(self):
         rng = numpy.random.default_rng(13)
         frame = pandas.DataFrame({"a": rng.normal(size=100), "b": rng.normal(size=100)})
         bank = CorruptionBank(infer_feature_schema(frame), frame, frame, repetitions=1, seed=2)
-        self.assertEqual(bank.applicable_families(), ["gaussian_noise"])
+        self.assertEqual(bank.applicable_families(), ["gaussian_noise", "median_masking"])
         noisy, counts = bank.corrupt("gaussian_noise", 0.5, 0)
         self.assertEqual(counts["changed"], 200)
         self.assertFalse(noisy.equals(frame))
+        # without any 0/1 input or availability flag, the numerical values can still be masked
+        masked, counts = bank.corrupt("median_masking", 1.0, 0)
+        self.assertEqual(counts["changed"], 200)
+        self.assertTrue((masked == frame.median()).all().all())
 
 
 class LinkedAvailabilityTests(unittest.TestCase):

@@ -9,7 +9,9 @@ docs/robustness.md):
                                 dependence shifts (pairs of correlated inputs weakened -- a share of the
                                 correlation removed, 100% = uncorrelated -- or strengthened)
   corrupted test sets           measurement noise, recording noise of 0/1 inputs, under-recording, values
-                                that are not available; one fixed bank of realisations for every model
+                                that are not available (value and flag), numerical values set to their
+                                training median (every dataset, flags untouched); one fixed bank of
+                                realisations for every model
 
 No feature is named anywhere: the scenarios come from the training data by fixed rules
 (robustness_config.RobustnessConfig), the same for every dataset. ROC-AUC is the primary metric (it does
@@ -100,6 +102,7 @@ FAMILY_LABELS: dict[str, str] = {
     "binary_redraw": "Recording noise (0/1 re-drawn)",
     "under_recording": "Under-recording (1 lost)",
     "value_masking": "Values not available",
+    "median_masking": "Numerical values masked (median)",
 }
 FAMILY_ORDER: tuple[str, ...] = REWEIGHTING_FAMILIES + robustness_utils.CORRUPTION_FAMILIES
 CORRUPTION_LEVEL_LABELS: dict[str, str] = {
@@ -107,6 +110,7 @@ CORRUPTION_LEVEL_LABELS: dict[str, str] = {
     "binary_redraw": "probability that a 0/1 input is re-drawn",
     "under_recording": "probability that a recorded 1 is lost",
     "value_masking": "probability that an available value is withheld",
+    "median_masking": "probability that a numerical value is set to its training median",
 }
 
 

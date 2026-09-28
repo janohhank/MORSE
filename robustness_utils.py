@@ -9,7 +9,8 @@ picked after seeing which one favours a method. There are two kinds of stress, w
   covariate shift). Only real rows are re-emphasised, so a re-weighting can never produce an impossible
   combination of values and needs no knowledge of what the features mean.
 * CORRUPTION changes recorded values: measurement noise, recording errors of 0/1 inputs, lost records,
-  values that are not available. It does not keep P(y | observed x), and it has to keep the data valid
+  values that are not available, numerical values replaced by their training median. It does not keep
+  P(y | observed x), and it has to keep the data valid
   by its STRUCTURAL rules: a one-hot group keeps at most one level (exactly one if it is exhaustive), a
   "not available" flag keeps its value at the fill value. Those rules are inferred from the names and the
   training data (`infer_feature_schema`) and checked after every corruption. A combination of 0/1 values
@@ -36,7 +37,10 @@ MAX_TILT_STRENGTH: float = 20.0
 # balanced (DependenceTilt).
 BALANCE_TOLERANCE: float = 1e-6
 
-CORRUPTION_FAMILIES: tuple[str, ...] = ("gaussian_noise", "binary_redraw", "under_recording", "value_masking")
+# Every family draws from its own random stream, spawned in this order (CorruptionBank): a new family is
+# APPENDED, so the streams -- and the corrupted test sets -- of the existing families stay the same.
+CORRUPTION_FAMILIES: tuple[str, ...] = ("gaussian_noise", "binary_redraw", "under_recording", "value_masking",
+                                        "median_masking")
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +918,11 @@ class CorruptionBank:
       value_masking   every available value with an availability flag becomes "not available" (the flag
                       set to its off level, its values to their fill values) with probability `level`, each
                       flag independently: at level 1 every value is withheld.
+      median_masking  every available value of a continuous input is replaced by its training median with
+                      probability `level`, cell by cell; every 0/1 input -- availability flags included -- is
+                      left unchanged, so the data do not say that the value was lost. The same operation
+                      applies to every dataset, with or without availability flags (a value that is already
+                      not available keeps its fill value). At level 1 every continuous input is constant.
     Availability flags are never re-drawn or under-recorded, so a flag and its values always agree. The
     structural rules (one-hot groups, availability pairs, 0/1 values) are checked after every corruption
     (a violation raises RuntimeError). A combination of 0/1 values that never occurs in training
@@ -939,6 +948,10 @@ class CorruptionBank:
             off_rows: numpy.ndarray = self._clean[:, column[indicator.flag]] == indicator.off_level
             for name in indicator.fills:
                 self._unavailable[off_rows, column[name]] = True
+
+        # -- numerical values masked: the same continuous inputs, set to their training medians
+        self._medians: numpy.ndarray = (X_train[schema.continuous].median().to_numpy(dtype=float)
+                                        if schema.continuous else numpy.zeros(0))
 
         # -- recording noise: one-hot groups first, then stand-alone inputs
         self._redraw_units: list[_Unit] = []
@@ -1003,6 +1016,7 @@ class CorruptionBank:
             "binary_redraw": bool(self._redraw_units),
             "under_recording": bool(self._under_units),
             "value_masking": bool(self._mask_units),
+            "median_masking": self._noise_columns.size > 0,
         }
         return [family for family in CORRUPTION_FAMILIES if available[family]]
 
@@ -1012,6 +1026,7 @@ class CorruptionBank:
             "binary_redraw": len(self._redraw_units),
             "under_recording": len(self._under_units),
             "value_masking": len(self._mask_units),
+            "median_masking": int(self._noise_columns.size),
         }
 
     # ---- random draws (made once per family and repetition) --------------------------------------------
@@ -1031,8 +1046,10 @@ class CorruptionBank:
                                     "value": rng.random((n_rows, len(self._redraw_units)))}
             elif family == "under_recording":
                 self._draws[key] = {"select": rng.random((n_rows, len(self._under_units)))}
-            else:   # value_masking
+            elif family == "value_masking":
                 self._draws[key] = {"select": rng.random((n_rows, len(self._mask_units)))}
+            else:   # median_masking
+                self._draws[key] = {"select": rng.random((n_rows, self._noise_columns.size))}
         return self._draws[key]
 
     # ---- corrupted data ---------------------------------------------------------------------------------
@@ -1051,8 +1068,10 @@ class CorruptionBank:
             counts = self._redraw(X, level, draws)
         elif family == "under_recording":
             counts = self._under_record(X, level, draws)
-        else:
+        elif family == "value_masking":
             counts = self._mask(X, level, draws)
+        else:
+            counts = self._median_mask(X, level, draws)
         self._check(X, family, level)
         counts.update(self._unseen_created(X))
         return pandas.DataFrame(X, columns=self._features, index=self._index), counts
@@ -1103,6 +1122,17 @@ class CorruptionBank:
                 X[rows, unit.flag] = unit.off_level
                 X[numpy.ix_(rows, unit.value_columns)] = unit.fills[None, :]
         return {"eligible": int(available.sum()), "selected": int(select.sum()), "changed": int(select.sum())}
+
+    def _median_mask(self, X: numpy.ndarray, level: float, draws: dict[str, numpy.ndarray]) -> dict[str, int]:
+        columns: numpy.ndarray = self._noise_columns
+        available: numpy.ndarray = ~self._unavailable[:, columns]
+        select: numpy.ndarray = available & (draws["select"] < level)
+        before: numpy.ndarray = X[:, columns]
+        after: numpy.ndarray = numpy.where(select, self._medians[None, :], before)
+        X[:, columns] = after
+        # a selected cell that already holds the median (e.g. an imputed one) is selected but not changed
+        return {"eligible": int(available.sum()), "selected": int(select.sum()),
+                "changed": int((after != before).sum())}
 
     # ---- validity and diagnostics ---------------------------------------------------------------------------
     @staticmethod

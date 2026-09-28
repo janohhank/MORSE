@@ -106,9 +106,9 @@ class SuiteTests(unittest.TestCase):
         self.assertLessEqual(int(scenarios["family"].str.startswith("dependence_").sum()), 5 * 8)   # pairs x levels
         families = set(self.results.summary["family"])
         self.assertTrue({"population", "gaussian_noise", "binary_redraw", "under_recording",
-                         "value_masking"} <= families)
+                         "value_masking", "median_masking"} <= families)
         corruption = pandas.read_csv(os.path.join(self.directory.name, "corruption_scores.csv"))
-        self.assertEqual(len(corruption), 4 * 2 * 2 * 8)     # families x levels x repetitions x models
+        self.assertEqual(len(corruption), 5 * 2 * 2 * 8)     # families x levels x repetitions x models
 
     def test_tests_compare_morse_with_every_baseline(self):
         tests = self.results.tests
