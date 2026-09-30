@@ -13,7 +13,7 @@ from sklearn.model_selection import StratifiedKFold
 
 from deap_types import ensure_multi_objective_types
 from training_config import TrainingConfig
-from training_utils import save_stats_csv
+from training_utils import save_stats_csv, standardised_folds
 from plot_utils import plot_multi_objective_convergence, plot_pareto_front
 from evaluation_utils import compute_marginal_correlations
 
@@ -21,6 +21,11 @@ from evaluation_utils import compute_marginal_correlations
 class MultiObjectiveTraining:
     """NSGA-II GA that co-optimises ROC/PR-AUC and sign-consistency over binary
     feature-subset masks.
+
+    `X_train` holds the UNSCALED training inputs: every CV fold is
+    standardised on its own training rows (`training_utils.standardised_folds`).
+    `standardise_folds=False` only re-evaluates runs made before 2026-09-28,
+    which passed the training set standardised as a whole.
     """
 
     def __init__(self,
@@ -28,16 +33,19 @@ class MultiObjectiveTraining:
                  feature_names: list[str],
                  X_train: numpy.ndarray,
                  y_train: numpy.ndarray,
-                 cv: StratifiedKFold) -> None:
+                 cv: StratifiedKFold,
+                 standardise_folds: bool = True) -> None:
         self._config: TrainingConfig = config
         self._feature_names: list[str] = feature_names
         self._X_train: numpy.ndarray = X_train
         self._y_train: numpy.ndarray = y_train
         self._cv: StratifiedKFold = cv
+        self._standardise_folds: bool = standardise_folds
 
         # Per-fold materialisation is lazy: the first call to _evaluate_multi
         # builds the (X_fold_train, X_fold_val, y_fold_train, y_fold_val)
-        # tuples AND the fold-level marginal correlation arrays once.
+        # tuples -- every fold standardised on its own training rows -- AND the
+        # fold-level marginal correlation arrays once.
         self._folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] | None = None
         # Per-fold marginal-correlation arrays; index-aligned with self._folds.
         # Computed on each fold's TRAINING partition -- the same data slice the
@@ -69,22 +77,17 @@ class MultiObjectiveTraining:
             (the same rows are held out from the LR fit but contribute
             to the correlation reference), which is a subtle but real
             metholodogical flaw.
+
+        The same holds for the standardisation: it is fitted on the fold's
+        training rows (`training_utils.standardised_folds`). The correlations
+        do not depend on the scaling.
         """
         if self._folds is not None:
             return
 
-        folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] = []
-        fold_corrs: list[numpy.ndarray] = []
-        for train_idx, val_idx in self._cv.split(self._X_train, self._y_train):
-            X_fold_train: numpy.ndarray = self._X_train[train_idx]
-            X_fold_val: numpy.ndarray = self._X_train[val_idx]
-            y_fold_train: numpy.ndarray = self._y_train[train_idx]
-            y_fold_val: numpy.ndarray = self._y_train[val_idx]
-
-            folds.append((X_fold_train, X_fold_val, y_fold_train, y_fold_val))
-            fold_corrs.append(compute_marginal_correlations(X_fold_train, y_fold_train))
-        self._folds = folds
-        self._fold_corrs = fold_corrs
+        self._folds = standardised_folds(self._X_train, self._y_train, self._cv, self._standardise_folds)
+        self._fold_corrs = [compute_marginal_correlations(X_fold_train, y_fold_train)
+                            for X_fold_train, _, y_fold_train, _ in self._folds]
 
     def evaluate_multi(self, individual: Sequence[int]) -> tuple[float, float]:
         key: tuple[int, ...] = tuple(individual)

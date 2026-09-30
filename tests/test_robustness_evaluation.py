@@ -220,18 +220,31 @@ class StandAloneTests(unittest.TestCase):
 
         X = numpy.ascontiguousarray(data["X_train"].to_numpy(), dtype=numpy.float64)
         y = numpy.ascontiguousarray(data["y_train"].to_numpy(), dtype=numpy.float64)
-        fingerprint = build_training_fingerprint(
-            config=TrainingConfig(seed=0), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-            feature_names=list(data["X_train"].columns), X_train=StandardScaler().fit_transform(X), y_train=y)
-        atomic_write_json(os.path.join(self.directory.name, "checkpoints", "training", "fingerprint.json"),
-                          fingerprint)
-        verify_training_data(self.directory.name, data["X_train"], data["y_train"])
-        changed = data["X_train"].copy()
-        changed.iloc[0, 0] += 1.0
-        with self.assertRaises(ValueError):
-            verify_training_data(self.directory.name, changed, data["y_train"])
-        with self.assertRaises(ValueError):
-            verify_training_data(self.directory.name, data["X_train"].iloc[:, ::-1], data["y_train"])
+        path = os.path.join(self.directory.name, "checkpoints", "training", "fingerprint.json")
+
+        def fingerprint(X_train: numpy.ndarray, legacy: bool) -> dict:
+            built = build_training_fingerprint(
+                config=TrainingConfig(seed=0), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+                feature_names=list(data["X_train"].columns), X_train=X_train, y_train=y)
+            if legacy:                     # a run made before 2026-09-28: no standardisation entry
+                del built["settings"]["standardisation"]
+            return built
+
+        # the trainers receive the unscaled inputs; runs made before 2026-09-28 received them standardised
+        for X_train, legacy in ((X, False), (StandardScaler().fit_transform(X), True)):
+            atomic_write_json(path, fingerprint(X_train, legacy))
+            verify_training_data(self.directory.name, data["X_train"], data["y_train"])
+            changed = data["X_train"].copy()
+            changed.iloc[0, 0] += 1.0
+            with self.assertRaises(ValueError):
+                verify_training_data(self.directory.name, changed, data["y_train"])
+            with self.assertRaises(ValueError):
+                verify_training_data(self.directory.name, data["X_train"].iloc[:, ::-1], data["y_train"])
+        # the two conventions are not interchangeable
+        for X_train, legacy in ((StandardScaler().fit_transform(X), False), (X, True)):
+            atomic_write_json(path, fingerprint(X_train, legacy))
+            with self.assertRaisesRegex(ValueError, "X_train"):
+                verify_training_data(self.directory.name, data["X_train"], data["y_train"])
 
 
 def write_run_folder(directory: str) -> dict:
@@ -256,7 +269,7 @@ def write_run_folder(directory: str) -> dict:
 
     data = load_archived_run(directory)
     features = list(data["X_train"].columns)
-    X_search = StandardScaler().fit_transform(numpy.ascontiguousarray(data["X_train"].to_numpy(), dtype=numpy.float64))
+    X_search = numpy.ascontiguousarray(data["X_train"].to_numpy(), dtype=numpy.float64)
     fingerprint = build_training_fingerprint(
         config=TrainingConfig(seed=0), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
         feature_names=features, X_train=X_search,
