@@ -13,12 +13,16 @@ from sklearn.model_selection import StratifiedKFold
 
 from deap_types import ensure_single_objective_types
 from training_config import TrainingConfig
-from training_utils import save_stats_csv
+from training_utils import save_stats_csv, standardised_folds
 from plot_utils import plot_single_objective_convergence
 
 
 class SingleObjectiveTraining:
     """Single-objective AUC-only GA baseline (DEAP `eaMuPlusLambda`).
+
+    `X_train` holds the UNSCALED training inputs: every CV fold is
+    standardised on its own training rows, as in `MultiObjectiveTraining`.
+    `standardise_folds=False` only re-evaluates runs made before 2026-09-28.
     """
 
     def __init__(self,
@@ -26,15 +30,18 @@ class SingleObjectiveTraining:
                  feature_names: list[str],
                  X_train: numpy.ndarray,
                  y_train: numpy.ndarray,
-                 cv: StratifiedKFold) -> None:
+                 cv: StratifiedKFold,
+                 standardise_folds: bool = True) -> None:
         self._config: TrainingConfig = config
         self._feature_names: list[str] = feature_names
         self._X_train: numpy.ndarray = X_train
         self._y_train: numpy.ndarray = y_train
         self._cv: StratifiedKFold = cv
+        self._standardise_folds: bool = standardise_folds
 
         # Per-fold materialisation is lazy: the first call to _evaluate_single
-        # builds the (scaled_train, scaled_val, y_train, y_val) tuples once.
+        # builds the (scaled_train, scaled_val, y_train, y_val) tuples once,
+        # every fold standardised on its own training rows.
         self._folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] | None = None
 
         # Per-instance evaluation cache.
@@ -46,15 +53,7 @@ class SingleObjectiveTraining:
     def _ensure_folds(self) -> None:
         if self._folds is not None:
             return
-        folds: list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]] = []
-        for train_idx, val_idx in self._cv.split(self._X_train, self._y_train):
-            X_fold_train: numpy.ndarray = self._X_train[train_idx]
-            X_fold_val: numpy.ndarray = self._X_train[val_idx]
-            y_fold_train: numpy.ndarray = self._y_train[train_idx]
-            y_fold_val: numpy.ndarray = self._y_train[val_idx]
-
-            folds.append((X_fold_train, X_fold_val, y_fold_train, y_fold_val))
-        self._folds = folds
+        self._folds = standardised_folds(self._X_train, self._y_train, self._cv, self._standardise_folds)
 
     def evaluate_single(self, individual: Sequence[int]) -> tuple[float]:
         key: tuple[int, ...] = tuple(individual)

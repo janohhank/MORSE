@@ -32,7 +32,8 @@ picked after seeing which one favours a method.
   of the notebook copy archived in the run folder (every code cell from the first one that assigns
   `TARGET_COLUMN` to the first one that assigns `X_test`), or of a copy given with `--notebook`. Either
   way, the training data are then checked against the run's checkpoint fingerprint (feature names,
-  hashes of the standardised training matrix and of the labels). The models are refit from the
+  hashes of the training matrix as the trainers received it -- unscaled, or standardised as a whole for
+  runs made before 2026-09-28 -- and of the labels). The models are refit from the
   checkpointed masks and checked against `evaluation/final_models_<rule>.json` (recorded the first time).
   Options: `--selection auto|knee|max_s` picks MORSE's Pareto solution (`auto` uses the run's own rule;
   another rule writes to `robustness_<rule>/`, so it never overwrites the run's own evaluation),

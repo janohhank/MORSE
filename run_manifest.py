@@ -34,9 +34,8 @@ from typing import Any, Callable, Sequence
 
 import numpy
 import pandas
-from sklearn.preprocessing import StandardScaler
-
-from checkpoint_utils import FINGERPRINT_FILE, _library_versions, array_fingerprint, atomic_write_json, read_json
+from checkpoint_utils import (FINGERPRINT_FILE, _library_versions, array_fingerprint, atomic_write_json, read_json,
+                              standardises_folds, trainer_inputs)
 from training_utils import repository_root
 
 MANIFEST_FILE: str = "run_manifest.json"
@@ -296,14 +295,14 @@ def load_run_data(run_directory: str, notebook: str | None = None) -> dict[str, 
 
 def verify_training_data(run_directory: str, X_train: pandas.DataFrame, y_train: Sequence[float]) -> dict[str, Any]:
     """Check that the training data are those the run's checkpoints were trained on -- the feature names
-    and the hashes of the standardised training matrix and of the labels, recomputed exactly as the
+    and the hashes of the training matrix as the run's trainers received it (unscaled; standardised on the
+    whole training set for runs made before 2026-09-28) and of the labels, recomputed exactly as the
     notebook computes them (checkpoint_utils.build_training_fingerprint) -- and return the fingerprint."""
     fingerprint: dict[str, Any] = read_json(os.path.join(run_directory, "checkpoints", "training", FINGERPRINT_FILE))
     names: list[str] = list(X_train.columns)
-    X_search: numpy.ndarray = numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64)
     current: dict[str, Any] = {
         "features": {"count": len(names), "sha256": hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()},
-        "X_train": array_fingerprint(StandardScaler().fit_transform(X_search)),
+        "X_train": array_fingerprint(trainer_inputs(X_train.to_numpy(), standardises_folds(fingerprint))),
         "y_train": array_fingerprint(numpy.ascontiguousarray(numpy.asarray(y_train), dtype=numpy.float64)),
     }
     settings: dict[str, Any] = fingerprint.get("settings", {})

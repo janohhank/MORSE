@@ -5,6 +5,7 @@ from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from training_config import TrainingConfig
 
@@ -19,7 +20,10 @@ class ForwardStepwiseTraining:
 
         result = ForwardStepwiseTraining(...).run()
 
-    Refit on each inner CV fold (no leakage across folds).
+    The scaler and the logistic regression are refitted on each inner CV
+    fold (no leakage across folds): `X_train` holds the UNSCALED training
+    inputs, and every fold is standardised on its own training rows, as in
+    the two GAs.
 
     `inner_n_jobs` maps to sklearn's `n_jobs` for SFS's own CV; it should be
     forced to 1 when the outer seed pool is parallel (loky x sklearn would
@@ -45,6 +49,7 @@ class ForwardStepwiseTraining:
         # L2 is scikit-learn's default penalty; an explicit `penalty="l2"` is
         # deprecated since scikit-learn 1.8 (removed in 1.10).
         pipe: Pipeline = Pipeline([
+            ("scaler", StandardScaler()),
             ("lr", LogisticRegression(
                 solver="lbfgs",
                 max_iter=1000, random_state=self._config.seed)),

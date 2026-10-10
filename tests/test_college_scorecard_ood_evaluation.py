@@ -32,6 +32,7 @@ from checkpoint_utils import (SeedTrainingResult, TrainingCheckpointStore, atomi
                               build_training_fingerprint)
 from deap_types import ensure_multi_objective_types, ensure_single_objective_types  # noqa: E402
 from evaluation_utils import build_model_package, predict_scores  # noqa: E402
+from multi_objective_training import MultiObjectiveTraining  # noqa: E402
 from training_config import TrainingConfig  # noqa: E402
 from training_utils import best_sign_consistency_index  # noqa: E402
 
@@ -68,8 +69,7 @@ def write_fixture(directory: str) -> dict:
     run = os.path.join(directory, "2026-01-01_00-00-00_cs")
     fingerprint = build_training_fingerprint(
         config=TrainingConfig(seed=0, use_roc_auc=False), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-        feature_names=features,
-        X_train=StandardScaler().fit_transform(numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64)),
+        feature_names=features, X_train=numpy.ascontiguousarray(X_train.to_numpy(), dtype=numpy.float64),
         y_train=numpy.ascontiguousarray(y_train, dtype=numpy.float64))
     store = TrainingCheckpointStore(os.path.join(run, "checkpoints", "training"), fingerprint)
     store.prepare()
@@ -134,14 +134,37 @@ class LoadingAndFingerprintTests(unittest.TestCase):
     def test_the_data_fingerprint_matches_the_checkpoint_fingerprint(self):
         X, y = ood.load_split(self.path, "label")
         current = ood.training_data_fingerprint(X, y)
-        full = build_training_fingerprint(
-            config=TrainingConfig(seed=0), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-            feature_names=list(X.columns),
-            X_train=StandardScaler().fit_transform(numpy.ascontiguousarray(X.to_numpy(), dtype=numpy.float64)),
-            y_train=numpy.ascontiguousarray(y, dtype=numpy.float64))
-        self.assertEqual(ood.fingerprint_differences(full, current), [])
         other = ood.training_data_fingerprint(X.iloc[:, ::-1], 1 - y)
-        self.assertEqual(len(ood.fingerprint_differences(full, other)), 3)
+        unscaled = numpy.ascontiguousarray(X.to_numpy(), dtype=numpy.float64)
+        # the trainers receive the unscaled inputs; runs made before 2026-09-28 received them standardised
+        for X_train, legacy in ((unscaled, False), (StandardScaler().fit_transform(unscaled), True)):
+            full = build_training_fingerprint(
+                config=TrainingConfig(seed=0), cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+                feature_names=list(X.columns), X_train=X_train, y_train=numpy.ascontiguousarray(y, dtype=numpy.float64))
+            if legacy:
+                del full["settings"]["standardisation"]
+            self.assertEqual(ood.fingerprint_differences(full, current), [])
+            self.assertEqual(len(ood.fingerprint_differences(full, other)), 3)
+            # the other convention's matrix is another matrix
+            full["settings"]["data"]["X_train"] = current["data_standardised" if not legacy else "data"]["X_train"]
+            self.assertEqual(ood.fingerprint_differences(full, current), ["the training data (X_train) differ"])
+
+    def test_the_cv_evaluator_standardises_as_the_run_did(self):
+        X, y = ood.load_split(self.path, "label")
+        features = list(X.columns)
+        unscaled = numpy.ascontiguousarray(X.to_numpy(), dtype=numpy.float64)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        fingerprint = build_training_fingerprint(config=TrainingConfig(seed=0), cv=cv, feature_names=features,
+                                                 X_train=unscaled, y_train=numpy.asarray(y, dtype=numpy.float64))
+        legacy = json.loads(json.dumps(fingerprint))
+        del legacy["settings"]["standardisation"]
+        mask = [1, 1, 0, 1, 0, 1]
+        config = TrainingConfig(seed=0)
+        per_fold = MultiObjectiveTraining(config, features, unscaled, y.astype(float), cv).evaluate_multi(mask)
+        as_a_whole = MultiObjectiveTraining(config, features, StandardScaler().fit_transform(unscaled), y.astype(float),
+                                            cv, standardise_folds=False).evaluate_multi(mask)
+        self.assertEqual(ood.cv_evaluator(fingerprint, X, y, features).evaluate_multi(mask), per_fold)
+        self.assertEqual(ood.cv_evaluator(legacy, X, y, features).evaluate_multi(mask), as_a_whole)
 
 
 class RunDiscoveryTests(unittest.TestCase):

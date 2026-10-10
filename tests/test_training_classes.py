@@ -1,8 +1,8 @@
 """Tests of the four trainers: MultiObjectiveTraining (NSGA-II, CV AUC + sign consistency),
 SingleObjectiveTraining (the AUC-only GA), ForwardStepwiseTraining and AllFeaturesTraining.
 
-The fitness functions are checked against a direct re-computation on the same folds; the GAs are run with a
-tiny population so that the tests take seconds.
+The fitness functions are checked against a direct re-computation on the same folds, every fold standardised on
+its own training rows; the GAs are run with a tiny population so that the tests take seconds.
 
 Run from the repository root:
 
@@ -18,9 +18,11 @@ import tempfile
 import unittest
 
 import numpy
+from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,13 +40,20 @@ N_FEATURES: int = 8
 
 
 def make_data(n: int = 300, seed: int = 0) -> tuple[numpy.ndarray, numpy.ndarray, list[str]]:
-    """Two informative inputs (x0 strongly, x1 as a suppressor of x0's correlated twin x2) and noise."""
+    """Informative inputs (x0 strongly, x1 as a suppressor of x0's correlated twin x2, a rare 0/1 input x6) and
+    noise, unscaled and on very different scales; x6 (4% ones) and the heavy-tailed x7 have SDs that differ
+    between the CV folds, so standardising every fold on its own training rows and standardising the whole
+    training set once give different fitness values."""
     rng = numpy.random.default_rng(seed)
     X = rng.normal(size=(n, N_FEATURES))
     X[:, 2] = 0.8 * X[:, 0] + 0.6 * rng.normal(size=n)
-    logit = 2.0 * X[:, 0] - 1.0 * X[:, 2] + 1.0 * X[:, 1]
+    X[:, 6] = (rng.random(n) < 0.04).astype(float)
+    logit = 2.0 * X[:, 0] - 1.0 * X[:, 2] + 1.0 * X[:, 1] + 1.5 * X[:, 6]
     y = (rng.random(n) < 1.0 / (1.0 + numpy.exp(-logit))).astype(float)
-    return StandardScaler().fit_transform(X), y, [f"x{i}" for i in range(N_FEATURES)]
+    X[:, 7] = rng.standard_t(df=1.5, size=n)
+    scales = numpy.array([1.0, 10.0, 0.1, 100.0, 1.0, 5.0, 1.0, 1.0])
+    offsets = numpy.array([0.0, 5.0, -3.0, 50.0, 0.0, 0.0, 0.0, 0.0])
+    return X * scales + offsets, y, [f"x{i}" for i in range(N_FEATURES)]
 
 
 def cv() -> StratifiedKFold:
@@ -56,15 +65,20 @@ def quietly(function, *args):
         return function(*args)
 
 
-def manual_fitness(X, y, mask, use_roc_auc: bool, seed: int = 0) -> tuple[float, float]:
+def manual_fitness(X, y, mask, use_roc_auc: bool, seed: int = 0, per_fold: bool = True) -> tuple[float, float]:
     """The CV fitness recomputed directly: mean fold AUC (or AP) and mean fold sign consistency, with the
-    marginal correlations of each fold's training part."""
+    marginal correlations of each fold's training part. `per_fold`: the selected inputs are standardised on
+    each fold's training rows (otherwise `X` is used as it is, e.g. standardised as a whole beforehand)."""
     columns = [i for i, bit in enumerate(mask) if bit]
     aucs, signs = [], []
     for train, validation in cv().split(X, y):
+        X_train, X_validation = X[train][:, columns], X[validation][:, columns]
+        if per_fold:
+            scaler = StandardScaler().fit(X_train)
+            X_train, X_validation = scaler.transform(X_train), scaler.transform(X_validation)
         model = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=seed)
-        model.fit(X[train][:, columns], y[train])
-        probabilities = model.predict_proba(X[validation][:, columns])[:, 1]
+        model.fit(X_train, y[train])
+        probabilities = model.predict_proba(X_validation)[:, 1]
         aucs.append(roc_auc_score(y[validation], probabilities) if use_roc_auc
                     else average_precision_score(y[validation], probabilities))
         product = compute_marginal_correlations(X[train], y[train])[columns] * model.coef_[0]
@@ -92,6 +106,23 @@ class ForwardStepwiseTrainingTests(unittest.TestCase):
             self.assertEqual(mask[0], 1, "the strongest input must be selected")
             self.assertLess(sum(mask), N_FEATURES, "the tol-based stopping must leave noise inputs out")
 
+    def test_every_fold_is_standardised_inside_the_pipeline(self):
+        X, y, _ = make_data(600)
+
+        def selection(estimator, inputs) -> list[int]:
+            selector = SequentialFeatureSelector(estimator, n_features_to_select="auto", tol=1e-3,
+                                                 direction="forward", scoring="roc_auc", cv=cv())
+            return [int(bit) for bit in selector.fit(inputs, y).get_support()]
+
+        mask = ForwardStepwiseTraining(TrainingConfig(seed=0), X, y, cv()).run()
+        model = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=0)
+        self.assertEqual(mask, selection(Pipeline([("scaler", StandardScaler()), ("lr", model)]), X))
+        # the scaler is refitted in every fold, so the selection does not depend on the scale of the inputs ...
+        rescaled = X * numpy.linspace(0.5, 20.0, N_FEATURES) - 7.0
+        self.assertEqual(ForwardStepwiseTraining(TrainingConfig(seed=0), rescaled, y, cv()).run(), mask)
+        # ... whereas without a scaler these unscaled inputs lead to another selection
+        self.assertNotEqual(selection(model, X), mask)
+
 
 class MultiObjectiveTrainingTests(unittest.TestCase):
     def setUp(self):
@@ -106,11 +137,25 @@ class MultiObjectiveTrainingTests(unittest.TestCase):
 
     def test_the_fitness_is_the_mean_over_the_folds(self):
         for use_roc_auc in (True, False):
-            for mask in ([1, 1, 1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], [1] * N_FEATURES):
+            for mask in ([1, 1, 1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 1, 0, 0, 1, 1],
+                         [1] * N_FEATURES):
                 auc, sign = self.trainer(use_roc_auc).evaluate_multi(mask)
                 expected_auc, expected_sign = manual_fitness(self.X, self.y, mask, use_roc_auc)
                 self.assertAlmostEqual(auc, expected_auc, places=12)
                 self.assertAlmostEqual(sign, expected_sign, places=12)
+
+    def test_runs_made_before_2026_09_28_are_re_evaluated_with_standardise_folds_false(self):
+        # those runs passed the training set standardised as a whole, and the folds were slices of it
+        standardised = StandardScaler().fit_transform(self.X)
+        legacy = MultiObjectiveTraining(TrainingConfig(seed=0), self.names, standardised, self.y, cv(),
+                                        standardise_folds=False)
+        mask = [1, 1, 0, 1, 0, 0, 1, 1]
+        auc, sign = legacy.evaluate_multi(mask)
+        expected_auc, expected_sign = manual_fitness(standardised, self.y, mask, True, per_fold=False)
+        self.assertAlmostEqual(auc, expected_auc, places=12)
+        self.assertAlmostEqual(sign, expected_sign, places=12)
+        # the validation rows of every fold contributed to that scaling: standardising per fold gives another value
+        self.assertNotAlmostEqual(auc, self.trainer().evaluate_multi(mask)[0], places=6)
 
     def test_sign_consistency_sees_the_suppressor(self):
         trainer = self.trainer()
@@ -173,9 +218,18 @@ class SingleObjectiveTrainingTests(unittest.TestCase):
 
     def test_the_fitness_is_the_mean_fold_auc(self):
         for use_roc_auc in (True, False):
-            mask = [1, 1, 0, 1, 0, 0, 0, 0]
-            (auc,) = self.trainer(use_roc_auc).evaluate_single(mask)
-            self.assertAlmostEqual(auc, manual_fitness(self.X, self.y, mask, use_roc_auc)[0], places=12)
+            for mask in ([1, 1, 0, 1, 0, 0, 0, 0], [1, 1, 0, 1, 0, 0, 1, 1]):
+                (auc,) = self.trainer(use_roc_auc).evaluate_single(mask)
+                self.assertAlmostEqual(auc, manual_fitness(self.X, self.y, mask, use_roc_auc)[0], places=12)
+
+    def test_runs_made_before_2026_09_28_are_re_evaluated_with_standardise_folds_false(self):
+        standardised = StandardScaler().fit_transform(self.X)
+        legacy = SingleObjectiveTraining(TrainingConfig(seed=0), self.names, standardised, self.y, cv(),
+                                         standardise_folds=False)
+        mask = [1, 1, 0, 1, 0, 0, 1, 1]
+        (auc,) = legacy.evaluate_single(mask)
+        self.assertAlmostEqual(auc, manual_fitness(standardised, self.y, mask, True, per_fold=False)[0], places=12)
+        self.assertNotAlmostEqual(auc, self.trainer().evaluate_single(mask)[0], places=6)
 
     def test_results_are_cached_until_cleared(self):
         trainer = self.trainer()

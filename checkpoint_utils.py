@@ -9,7 +9,8 @@ up instead of training again.
 Layout, under `<run directory>/checkpoints/training/`:
 
     fingerprint.json      what the checkpoints belong to (training configuration, CV
-                          settings, feature names, hashes of the training data)
+                          settings, how the inputs are standardised, feature names,
+                          hashes of the training data)
     shared_baselines.json the forward-stepwise and all-features masks: they do not
                           depend on the seed, so they are computed ONCE and copied
                           into every seed
@@ -63,11 +64,19 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy
 from deap import creator
 from joblib import Parallel, delayed
+from sklearn.preprocessing import StandardScaler
 
 from deap_types import ensure_multi_objective_types, ensure_single_objective_types
 from training_utils import ensure_directory
 
 SCHEMA_VERSION: int = 1
+
+# How the trainers standardise the inputs, recorded in the fingerprint's settings: they receive the unscaled
+# training inputs and standardise every cross-validation fold on its own training rows (training_utils.
+# standardised_folds; SFS: a StandardScaler in its pipeline). A fingerprint without this entry belongs to a run
+# made before 2026-09-28, whose notebook standardised the whole training set once before the search, so the
+# validation rows of every fold contributed to its scaling. Such checkpoints must not be resumed with this code.
+STANDARDISATION: str = "per_fold"
 
 FINGERPRINT_FILE: str = "fingerprint.json"
 SHARED_BASELINES_FILE: str = "shared_baselines.json"
@@ -188,13 +197,15 @@ def build_training_fingerprint(
 
     `settings` are the things that make old results unusable when they change:
     every field of the training configuration (except the per-seed `seed` and the
-    output directory), the cross-validation splitter, the feature names and the
-    training data itself. `environment` is informational (library versions and the
-    hash of the algorithm source files): a difference there only produces a warning.
+    output directory), the cross-validation splitter, the standardisation of the
+    inputs (`STANDARDISATION`), the feature names and the training data itself.
+    `environment` is informational (library versions and the hash of the algorithm
+    source files): a difference there only produces a warning.
 
     config:       the `TrainingConfig` (any dataclass) used for the seeds.
     cv:           the shared cross-validation splitter (StratifiedKFold).
-    X_train:      the array the trainers receive (after scaling).
+    X_train:      the array the trainers receive: the unscaled training inputs, as
+                  the trainers standardise every fold themselves (`trainer_inputs`).
     code_objects: classes / functions whose source files are hashed.
     """
     training_config: dict[str, Any] = {
@@ -210,6 +221,7 @@ def build_training_fingerprint(
                 "shuffle": bool(getattr(cv, "shuffle", False)),
                 "random_state": random_state if isinstance(random_state, (int, type(None))) else repr(random_state),
             },
+            "standardisation": STANDARDISATION,
             "features": {
                 "count": len(feature_names),
                 "sha256": hashlib.sha256("\n".join(feature_names).encode("utf-8")).hexdigest(),
@@ -224,6 +236,20 @@ def build_training_fingerprint(
             "source_sha256": source_fingerprint(code_objects),
         },
     }
+
+
+def standardises_folds(fingerprint: dict[str, Any]) -> bool:
+    """Whether the run of a training fingerprint standardised every CV fold on its own training rows (True),
+    or -- a run made before 2026-09-28 -- the whole training set once before the search (False)."""
+    return fingerprint.get("settings", {}).get("standardisation") == STANDARDISATION
+
+
+def trainer_inputs(X_train: numpy.ndarray, per_fold: bool) -> numpy.ndarray:
+    """The training matrix as the trainers of a run received it -- the matrix whose hash the run's fingerprint
+    holds -- float64 and C-contiguous: unscaled when the run standardised every fold itself (`per_fold`),
+    standardised on the whole training set for a run made before 2026-09-28."""
+    X: numpy.ndarray = numpy.ascontiguousarray(X_train, dtype=numpy.float64)
+    return X if per_fold else StandardScaler().fit_transform(X)
 
 
 def _flatten(prefix: str, value: Any, out: dict[str, Any]) -> dict[str, Any]:
@@ -249,6 +275,10 @@ def _describe_difference(key: str, before: Any, after: Any) -> str:
         if after == "<absent>":
             return f"{name} is no longer part of the code"
         return f"{name} changed since the checkpoints were written"
+    if key == "settings.standardisation" and before == "<absent>":
+        return ("standardisation: the checkpoints were trained on a training set standardised as a whole before "
+                "the search (runs made before 2026-09-28); this code standardises every cross-validation fold on "
+                "its own training rows")
     return f"{key}: checkpoint has {_short(before)}, current run has {_short(after)}"
 
 
